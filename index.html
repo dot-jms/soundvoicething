@@ -1105,6 +1105,7 @@ class AudioEngine {
     this.formants = { f1: 0, f2: 0, f3: 0 };
     this.vowelScores = { A: 0, E: 0, I: 0, O: 0, U: 0 };
     this.scopeData = null;
+    this.detectedMidi = -1;
 
     // Params
     this.params = {
@@ -1464,7 +1465,7 @@ class AudioEngine {
     for (let j = minBin; j <= maxBin; j++) {
       if (this.rawFFT[j] > peakVal) { peakVal = this.rawFFT[j]; peakBin = j; }
     }
-    if (peakBin > 0 && peakVal > -60) {
+    if (peakBin > 0 && peakVal > -80) {
       const detectedFreq = peakBin * binRes;
       this.detectedMidi = fToM(detectedFreq);
     } else {
@@ -1760,8 +1761,10 @@ class MidiRecorder {
     const a     = document.createElement('a');
     a.href = url;
     a.download = 'vocoder_voice.mid';
+    a.style.display = 'none';
+    document.body.appendChild(a);
     a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setTimeout(() => { URL.revokeObjectURL(url); document.body.removeChild(a); }, 1000);
   }
 }
 
