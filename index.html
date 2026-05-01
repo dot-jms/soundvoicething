@@ -1223,7 +1223,14 @@ class AudioEngine {
     this.nodes.scopeAnalyser.smoothingTimeConstant = 0.8;
     this.scopeData = new Float32Array(this.nodes.scopeAnalyser.frequencyBinCount);
 
+    // Pitch analyser — time domain, no smoothing, for autocorrelation
+    this.nodes.pitchAnalyser = this.ctx.createAnalyser();
+    this.nodes.pitchAnalyser.fftSize = 2048;
+    this.nodes.pitchAnalyser.smoothingTimeConstant = 0;
+    this._pitchBuf = new Float32Array(2048);
+
     this.nodes.src.connect(this.nodes.analyser);
+    this.nodes.src.connect(this.nodes.pitchAnalyser);
 
     // Carrier mix
     this.nodes.carrierMix = this.ctx.createGain();
@@ -1457,19 +1464,39 @@ class AudioEngine {
     for (let i = 0; i < td.length; i++) rmsSum += td[i] * td[i];
     this.vuLevel = Math.sqrt(rmsSum / td.length);
 
-    // Pitch tracking via spectral peak (for MIDI recording)
-    // Find the loudest FFT bin in the voiced range (80–1200 Hz)
-    const minBin = Math.floor(80  / binRes);
-    const maxBin = Math.ceil(1200 / binRes);
-    let peakBin = -1, peakVal = -Infinity;
-    for (let j = minBin; j <= maxBin; j++) {
-      if (this.rawFFT[j] > peakVal) { peakVal = this.rawFFT[j]; peakBin = j; }
-    }
-    if (peakBin > 0 && peakVal > -80) {
-      const detectedFreq = peakBin * binRes;
-      this.detectedMidi = fToM(detectedFreq);
+    // Pitch tracking via autocorrelation on time-domain signal from source
+    this.nodes.pitchAnalyser.getFloatTimeDomainData(this._pitchBuf);
+    const buf = this._pitchBuf;
+    const sr  = this.ctx.sampleRate;
+    const np  = buf.length;
+
+    // RMS gate — skip silent frames
+    let rmsP = 0;
+    for (let i = 0; i < np; i++) rmsP += buf[i] * buf[i];
+    rmsP = Math.sqrt(rmsP / np);
+
+    if (rmsP > 0.01) {
+      // Autocorrelation in voiced range 60-1000 Hz
+      const minLag = Math.floor(sr / 1000);
+      const maxLag = Math.ceil(sr / 60);
+      let bestLag = -1, bestCorr = -Infinity;
+      const norm0 = buf.reduce((s, v) => s + v * v, 0) || 1;
+      for (let lag = minLag; lag <= maxLag; lag++) {
+        let c = 0;
+        for (let i = 0; i < np - lag; i++) c += buf[i] * buf[i + lag];
+        const nc = c / norm0;
+        if (nc > bestCorr) { bestCorr = nc; bestLag = lag; }
+      }
+      if (bestLag > 0 && bestCorr > 0.15) {
+        this.detectedMidi = fToM(sr / bestLag);
+        this._pitchRms = rmsP;
+      } else {
+        this.detectedMidi = -1;
+        this._pitchRms = 0;
+      }
     } else {
       this.detectedMidi = -1;
+      this._pitchRms = 0;
     }
   }
 
@@ -1671,13 +1698,14 @@ class MidiRecorder {
     if (!this.isRecording) return;
     const now = (performance.now() - this.startTime) / 1000; // seconds
     const midi = midiFloat >= 0 ? Math.round(midiFloat) : -1;
-    const vel  = Math.min(127, Math.round(volume * 127 * 1.5));
+    // volume is raw RMS (0.01–1.0), scale to MIDI velocity
+    const vel  = Math.min(127, Math.max(1, Math.round(volume * 800)));
 
     if (midi !== this.lastMidi) {
       // Close previous note
       if (this.lastMidi >= 0) this._noteOff(this.lastMidi, now);
-      // Open new note
-      if (midi >= 0 && vel > 8) { this._noteOn(midi, vel, now); this.lastOnTime = now; }
+      // Open new note — no vel gate, autocorrelation already gates on RMS
+      if (midi >= 0) { this._noteOn(midi, vel, now); this.lastOnTime = now; }
       this.lastMidi = midi;
     }
   }
@@ -2122,8 +2150,9 @@ class UIController {
     const tilt = this.knobs.tilt.value;
     this.engine.processFrame(tilt);
 
-    // Feed pitch to MIDI recorder
-    this.midi.feed(this.engine.detectedMidi, this.engine.vuLevel);
+    // Feed pitch to MIDI recorder — use source RMS for velocity, not vocoder output
+    const midiVel = this.engine._pitchRms != null ? this.engine._pitchRms : this.engine.vuLevel;
+    this.midi.feed(this.engine.detectedMidi, midiVel);
     const nc = this.midi.noteCount;
     document.getElementById('midiNoteCount').textContent = nc;
 
