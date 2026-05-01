@@ -1208,103 +1208,314 @@ class AudioEngine {
     this.carrierOscillators = [];
     this.nodes = {};
 
-    // ── AudioWorklet: sample-accurate envelope follower ──
-    // Runs in the audio thread at 128-sample blocks (~2.9ms at 44.1kHz)
-    // instead of requestAnimationFrame (~16ms). This is what lets speech
-    // transients — stop consonants, fricatives, plosives — actually get captured.
-    const NUM_BANDS = 32;
-    this.NUM_BANDS = NUM_BANDS;
-    this._envState = new Float32Array(NUM_BANDS);
+    // ── LPC Vocoder AudioWorklet ──
+    // LPC (Linear Predictive Coding) directly models the vocal tract as an
+    // all-pole filter, then re-excites it with a synthetic carrier.
+    // This is how real intelligible vocoders work — phones, codecs, Speak & Spell.
+    // The worklet does everything in the audio thread:
+    //   1. Buffer incoming voice frames
+    //   2. Run Levinson-Durbin LPC analysis every 10ms
+    //   3. Generate carrier (pitched saw + noise for unvoiced)
+    //   4. Filter carrier through LPC synthesis filter
+    //   5. Output synthesized speech
 
-    // Band frequencies: log-spaced 80Hz–8kHz
-    const bandFreqs = Array.from({ length: NUM_BANDS }, (_, i) =>
-      80 * Math.pow(8000 / 80, i / (NUM_BANDS - 1))
-    );
+    const LPC_ORDER = 16; // 16 poles captures vocal tract well for speech
+    const lpcParams = {
+      pitch:       mToF(pitch),
+      waveType:    waveType,
+      unison:      unison,
+      detune:      detune,
+      noiseOn:     noiseOn,
+      noiseLevel:  noiseLevel,
+      vibratoOn:   vibratoOn,
+      vibratoRate: vibratoRate,
+      vibratoDepth: vibratoDepth,
+      vol:         dbToGain(vol),
+    };
 
     const workletCode = `
-class VocoderWorklet extends AudioWorkletProcessor {
+class LPCVocoderWorklet extends AudioWorkletProcessor {
   constructor(options) {
     super();
-    const sr = sampleRate;
-    const n = ${NUM_BANDS};
-    this.n = n;
+    const p = options.processorOptions;
+    this.sr = sampleRate;
+    this.order = ${LPC_ORDER};
 
-    // Per-band bandpass filter state (biquad, direct form II)
-    // Each band has a modulator filter (to measure envelope) and
-    // we output the per-band envelope values to the main thread each block.
-    this.modFilters = [];
-    for (let i = 0; i < n; i++) {
-      const freq = ${JSON.stringify(bandFreqs)}[i];
-      const Q = freq < 500 ? 2.5 : freq < 2000 ? 3.5 : 5.0;
-      this.modFilters.push(this._makeBP(freq, Q, sr));
+    // LPC analysis frame: 20ms with 10ms hop
+    this.frameSize = Math.round(this.sr * 0.020);
+    this.hopSize   = Math.round(this.sr * 0.010);
+    this.inputBuf  = new Float32Array(this.frameSize * 2);
+    this.inputFill = 0;
+    this.samplesUntilNextFrame = this.hopSize;
+
+    // Current LPC coefficients (interpolated toward target each hop)
+    this.lpcCoeffs    = new Float32Array(this.order);
+    this.lpcTarget    = new Float32Array(this.order);
+    this.lpcGain      = 1;
+    this.lpcGainTarget = 1;
+
+    // Synthesis filter state (all-pole IIR)
+    this.synthDelay = new Float32Array(this.order);
+
+    // Carrier state
+    this.phase      = 0;
+    this.noiseState = Math.random();
+
+    // Params (updated via port)
+    this.pitch       = p.pitch;
+    this.waveType    = p.waveType;
+    this.unison      = p.unison;
+    this.detune      = p.detune * 0.01; // cents → semitone fraction
+    this.noiseOn     = p.noiseOn;
+    this.noiseLevel  = p.noiseLevel;
+    this.vibratoOn   = p.vibratoOn;
+    this.vibratoRate = p.vibratoRate;
+    this.vibratoDepth = p.vibratoDepth * 0.01; // cents → semitone fraction
+    this.vol         = p.vol;
+    this.vibratoPhase = 0;
+
+    // Voiced/unvoiced detection
+    this.isVoiced    = false;
+    this.voicedSmooth = 0;
+
+    // Unison oscillator phases
+    this.unisonPhases = new Float32Array(Math.max(p.unison, 1));
+    for (let i = 0; i < this.unisonPhases.length; i++) {
+      this.unisonPhases[i] = Math.random(); // stagger phases
     }
 
-    // Envelope state per band
-    // Attack: 5ms, Release: 60ms — fast enough for plosives, smooth enough for vowels
-    this.envState = new Float32Array(n);
-    this.attackCoeff  = 1 - Math.exp(-1 / (sr * 0.005));
-    this.releaseCoeff = 1 - Math.exp(-1 / (sr * 0.060));
+    // For display: send RMS and detected pitch back to main thread
+    this.displayCounter = 0;
 
-    // Shared output ring — post-processed env values sent to main thread
-    this._frameCount = 0;
-
-    // Port for sending envelope data back
-    this.port.onmessage = () => {}; // no inbound needed
-  }
-
-  _makeBP(freq, Q, sr) {
-    // Bilinear-transform bandpass
-    const w0 = 2 * Math.PI * freq / sr;
-    const alpha = Math.sin(w0) / (2 * Q);
-    const cosw0 = Math.cos(w0);
-    const b0 =  alpha,
-          b1 =  0,
-          b2 = -alpha,
-          a0 =  1 + alpha,
-          a1 = -2 * cosw0,
-          a2 =  1 - alpha;
-    return {
-      b0: b0/a0, b1: b1/a0, b2: b2/a0,
-      a1: a1/a0, a2: a2/a0,
-      z1: 0, z2: 0
+    this.port.onmessage = (e) => {
+      if (!e.data) return;
+      if (e.data.pitch       !== undefined) this.pitch       = e.data.pitch;
+      if (e.data.waveType    !== undefined) this.waveType    = e.data.waveType;
+      if (e.data.unison      !== undefined) {
+        this.unison = e.data.unison;
+        this.unisonPhases = new Float32Array(Math.max(this.unison, 1));
+      }
+      if (e.data.detune      !== undefined) this.detune      = e.data.detune * 0.01;
+      if (e.data.noiseOn     !== undefined) this.noiseOn     = e.data.noiseOn;
+      if (e.data.noiseLevel  !== undefined) this.noiseLevel  = e.data.noiseLevel;
+      if (e.data.vibratoOn   !== undefined) this.vibratoOn   = e.data.vibratoOn;
+      if (e.data.vibratoDepth !== undefined) this.vibratoDepth = e.data.vibratoDepth * 0.01;
+      if (e.data.vol         !== undefined) this.vol         = e.data.vol;
     };
   }
 
-  _bpSample(f, x) {
-    const y = f.b0 * x + f.z1;
-    f.z1 = f.b1 * x - f.a1 * y + f.z2;
-    f.z2 = f.b2 * x - f.a2 * y;
-    return y;
-  }
+  // ── Levinson-Durbin LPC analysis ──
+  // Computes LPC coefficients from a windowed speech frame.
+  // Returns { coeffs, gain }.
+  _computeLPC(frame) {
+    const n = frame.length;
+    const order = this.order;
 
-  process(inputs) {
-    const mod = inputs[0]?.[0]; // modulator (voice)
-    if (!mod || mod.length === 0) return true;
-
-    const blockSize = mod.length;
-    const envOut = new Float32Array(this.n);
-
-    // Per-sample envelope following
-    for (let i = 0; i < blockSize; i++) {
-      const x = mod[i];
-      for (let b = 0; b < this.n; b++) {
-        const y = this._bpSample(this.modFilters[b], x);
-        const rect = Math.abs(y);
-        const prev = this.envState[b];
-        const coeff = rect > prev ? this.attackCoeff : this.releaseCoeff;
-        this.envState[b] = prev + coeff * (rect - prev);
-      }
+    // Apply Hann window
+    const windowed = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      windowed[i] = frame[i] * 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1)));
     }
 
-    // Copy current env state out after processing the block
-    envOut.set(this.envState);
+    // Autocorrelation
+    const r = new Float32Array(order + 1);
+    for (let lag = 0; lag <= order; lag++) {
+      let sum = 0;
+      for (let i = 0; i < n - lag; i++) sum += windowed[i] * windowed[i + lag];
+      r[lag] = sum;
+    }
 
-    // Send envelope to main thread every block
-    this.port.postMessage({ env: envOut }, [envOut.buffer]);
+    if (r[0] < 1e-10) return { coeffs: new Float32Array(order), gain: 0 };
+
+    // Add tiny noise floor to r[0] for numerical stability (Wiener-Hopf)
+    r[0] *= 1.001;
+
+    // Levinson-Durbin recursion
+    const a   = new Float32Array(order + 1); // predictor coefficients
+    const tmp = new Float32Array(order + 1);
+    let error = r[0];
+
+    for (let m = 1; m <= order; m++) {
+      let lambda = 0;
+      for (let j = 1; j < m; j++) lambda += a[j] * r[m - j];
+      lambda = -(r[m] + lambda) / error;
+
+      // Clamp reflection coefficient for stability
+      const k = Math.max(-0.999, Math.min(0.999, lambda));
+
+      // Update coefficients
+      for (let j = 1; j <= m; j++) tmp[j] = a[j];
+      for (let j = 1; j <= m; j++) a[j] = tmp[j] + k * tmp[m - j];
+      a[m] = k;
+
+      error *= (1 - k * k);
+      if (error < 1e-20) break;
+    }
+
+    // Prediction gain = sqrt of prediction error power
+    const gain = Math.sqrt(Math.max(0, error));
+
+    // a[1..order] are the predictor coefficients (LPC filter denominator)
+    const coeffs = new Float32Array(order);
+    for (let i = 0; i < order; i++) coeffs[i] = -a[i + 1]; // negated for synthesis filter
+    return { coeffs, gain };
+  }
+
+  // ── Voiced/unvoiced detection via zero crossing rate ──
+  _detectVoiced(frame) {
+    const n = frame.length;
+    let zcr = 0, energy = 0;
+    for (let i = 1; i < n; i++) {
+      if ((frame[i] >= 0) !== (frame[i-1] >= 0)) zcr++;
+      energy += frame[i] * frame[i];
+    }
+    const rms = Math.sqrt(energy / n);
+    const zcrRate = zcr / n;
+    // Low ZCR + sufficient energy = voiced (vowel/sonorant)
+    // High ZCR = unvoiced fricative (s, f, sh)
+    // Very low energy = silence
+    if (rms < 0.005) return 0;   // silence
+    if (zcrRate > 0.35) return 0.2; // unvoiced — small noise component
+    return 1; // voiced
+  }
+
+  // ── Generate one sample of carrier ──
+  _carrierSample(freq) {
+    const sr = this.sr;
+    let out = 0;
+
+    // Vibrato
+    let pitchMod = 1.0;
+    if (this.vibratoOn) {
+      this.vibratoPhase += this.vibratoRate / sr;
+      pitchMod = Math.pow(2, Math.sin(this.vibratoPhase * 2 * Math.PI) * this.vibratoDepth / 12);
+    }
+    const f = freq * pitchMod;
+
+    // Unison voices
+    const n = Math.max(1, this.unison);
+    for (let v = 0; v < n; v++) {
+      const spread = n === 1 ? 0 : ((v / (n - 1)) - 0.5) * 2;
+      const detunedF = f * Math.pow(2, spread * this.detune / 12);
+      this.unisonPhases[v] = (this.unisonPhases[v] + detunedF / sr) % 1;
+      const ph = this.unisonPhases[v];
+
+      let s = 0;
+      if (this.waveType === 'sawtooth') {
+        s = 2 * ph - 1;
+      } else if (this.waveType === 'square') {
+        s = ph < 0.5 ? 1 : -1;
+      } else if (this.waveType === 'triangle') {
+        s = ph < 0.5 ? 4 * ph - 1 : 3 - 4 * ph;
+      } else { // sine
+        s = Math.sin(2 * Math.PI * ph);
+      }
+      out += s / n;
+    }
+
+    // Noise mix for unvoiced/breath
+    if (this.noiseOn) {
+      // xorshift fast noise
+      let x = (this.noiseState * 2147483647) | 0;
+      x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+      this.noiseState = (x / 2147483647 + 1) * 0.5;
+      const noise = (this.noiseState * 2 - 1);
+      out = out * (1 - this.noiseLevel * 0.4) + noise * this.noiseLevel * 0.4;
+    }
+
+    return out;
+  }
+
+  process(inputs, outputs) {
+    const input  = inputs[0]?.[0];
+    const output = outputs[0]?.[0];
+    if (!output) return true;
+    if (!input || input.length === 0) {
+      output.fill(0);
+      return true;
+    }
+
+    const blockSize = output.length;
+
+    for (let i = 0; i < blockSize; i++) {
+      // Accumulate input into circular analysis buffer
+      const writePos = this.inputFill % this.inputBuf.length;
+      this.inputBuf[writePos] = input[i];
+      this.inputFill++;
+
+      // Run LPC analysis every hop
+      this.samplesUntilNextFrame--;
+      if (this.samplesUntilNextFrame <= 0) {
+        this.samplesUntilNextFrame = this.hopSize;
+
+        // Extract frame from ring buffer
+        const frame = new Float32Array(this.frameSize);
+        const startPos = this.inputFill - this.frameSize;
+        for (let j = 0; j < this.frameSize; j++) {
+          const idx = (startPos + j) % this.inputBuf.length;
+          frame[j] = this.inputBuf[(idx + this.inputBuf.length) % this.inputBuf.length];
+        }
+
+        const { coeffs, gain } = this._computeLPC(frame);
+        this.lpcTarget.set(coeffs);
+        this.lpcGainTarget = gain;
+        this.isVoiced = this._detectVoiced(frame) > 0.5;
+        this.voicedSmooth += (this._detectVoiced(frame) - this.voicedSmooth) * 0.3;
+      }
+
+      // Interpolate LPC coefficients toward target (prevents discontinuities)
+      const lerpRate = 0.005; // smooth over ~200 samples
+      this.lpcGain += (this.lpcGainTarget - this.lpcGain) * lerpRate;
+      for (let j = 0; j < this.order; j++) {
+        this.lpcCoeffs[j] += (this.lpcTarget[j] - this.lpcCoeffs[j]) * lerpRate;
+      }
+
+      // Generate carrier sample
+      const excitation = this._carrierSample(this.pitch);
+
+      // Scale excitation by LPC gain (so output amplitude matches original)
+      // When voiced: pitched carrier scaled by gain
+      // When unvoiced: noise scaled by gain (fricatives need noise not pitch)
+      let exc;
+      if (this.voicedSmooth > 0.5) {
+        exc = excitation * this.lpcGain;
+      } else {
+        // Unvoiced: mix in more noise
+        const ns = (Math.random() * 2 - 1);
+        exc = (excitation * 0.3 + ns * 0.7) * this.lpcGain;
+      }
+
+      // All-pole LPC synthesis filter: H(z) = 1 / A(z)
+      // y[n] = exc[n] + sum(coeffs[k] * y[n-k])
+      let y = exc;
+      for (let j = 0; j < this.order; j++) {
+        y += this.lpcCoeffs[j] * this.synthDelay[j];
+      }
+
+      // Shift delay line
+      for (let j = this.order - 1; j > 0; j--) {
+        this.synthDelay[j] = this.synthDelay[j - 1];
+      }
+      this.synthDelay[0] = y;
+
+      // Soft clip to prevent blowup if LPC goes unstable
+      output[i] = Math.tanh(y * this.vol * 0.5);
+    }
+
+    // Send display data back every ~16ms
+    this.displayCounter += blockSize;
+    if (this.displayCounter >= 512) {
+      this.displayCounter = 0;
+      let rms = 0;
+      for (let i = 0; i < blockSize; i++) rms += output[i] * output[i];
+      rms = Math.sqrt(rms / blockSize);
+      this.port.postMessage({ rms, voiced: this.voicedSmooth });
+    }
+
     return true;
   }
 }
-registerProcessor('vocoder-worklet', VocoderWorklet);
+registerProcessor('lpc-vocoder', LPCVocoderWorklet);
 `;
 
     const blob = new Blob([workletCode], { type: 'application/javascript' });
@@ -1312,127 +1523,52 @@ registerProcessor('vocoder-worklet', VocoderWorklet);
     await this.ctx.audioWorklet.addModule(workletUrl);
     URL.revokeObjectURL(workletUrl);
 
-    // Source
+    // Source node
     this.nodes.src = this.ctx.createBufferSource();
     this.nodes.src.buffer = this.audioBuffer;
 
-    // Modulator worklet node — voice feeds in, envelope data comes back
-    this.nodes.modWorklet = new AudioWorkletNode(this.ctx, 'vocoder-worklet', {
-      numberOfInputs: 1,
-      numberOfOutputs: 0,
-      channelCount: 1,
-    });
-
-    // Worklet sends envelope data back to main thread
-    this._lastEnv = new Float32Array(NUM_BANDS);
-    this.nodes.modWorklet.port.onmessage = (e) => {
-      if (e.data?.env) this._lastEnv = e.data.env;
-    };
-
-    this.nodes.src.connect(this.nodes.modWorklet);
-
-    // Analyser for FFT display & pitch tracking (separate from worklet)
+    // Analyser for FFT display
     this.nodes.analyser = this.ctx.createAnalyser();
     this.nodes.analyser.fftSize = 4096;
-    this.nodes.analyser.smoothingTimeConstant = 0.0;
+    this.nodes.analyser.smoothingTimeConstant = 0.1;
     this.rawFFT = new Float32Array(this.nodes.analyser.frequencyBinCount);
     this.nodes.src.connect(this.nodes.analyser);
 
-    // Pitch analyser — time-domain for autocorrelation
+    // Pitch analyser for MIDI tracking
     this.nodes.pitchAnalyser = this.ctx.createAnalyser();
     this.nodes.pitchAnalyser.fftSize = 2048;
     this.nodes.pitchAnalyser.smoothingTimeConstant = 0;
     this._pitchBuf = new Float32Array(2048);
     this.nodes.src.connect(this.nodes.pitchAnalyser);
 
-    // Scope analyser — output waveform
+    // LPC vocoder worklet — voice in, synthesized speech out
+    this.nodes.lpcWorklet = new AudioWorkletNode(this.ctx, 'lpc-vocoder', {
+      numberOfInputs:  1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+      processorOptions: lpcParams,
+    });
+
+    this.nodes.src.connect(this.nodes.lpcWorklet);
+
+    // Receive display data from worklet
+    this.vuLevel = 0;
+    this.nodes.lpcWorklet.port.onmessage = (e) => {
+      if (e.data?.rms !== undefined) this.vuLevel = e.data.rms;
+    };
+
+    // Scope analyser on output
     this.nodes.scopeAnalyser = this.ctx.createAnalyser();
     this.nodes.scopeAnalyser.fftSize = 2048;
     this.nodes.scopeAnalyser.smoothingTimeConstant = 0.8;
     this.scopeData = new Float32Array(this.nodes.scopeAnalyser.frequencyBinCount);
 
-    // Carrier mix
-    this.nodes.carrierMix = this.ctx.createGain();
-    const baseFreq = mToF(pitch);
-    const voiceGain = 1.0 / Math.max(1, unison);
-
-    // Unison oscillators
-    for (let v = 0; v < unison; v++) {
-      const spread = unison === 1 ? 0 : ((v / (unison - 1)) - 0.5) * 2;
-      const detuneVal = spread * detune;
-      const pan = unison === 1 ? 0 : spread * 0.7;
-
-      const osc = this.ctx.createOscillator();
-      osc.type = waveType;
-      osc.frequency.value = baseFreq;
-      osc.detune.value = detuneVal;
-
-      const g = this.ctx.createGain();
-      g.gain.value = voiceGain;
-
-      const panner = this.ctx.createStereoPanner();
-      panner.pan.value = pan;
-
-      if (vibratoOn) {
-        const lfo = this.ctx.createOscillator();
-        lfo.frequency.value = vibratoRate;
-        const lfoGain = this.ctx.createGain();
-        lfoGain.gain.value = vibratoDepth;
-        lfo.connect(lfoGain).connect(osc.detune);
-        lfo.start(0);
-        this.carrierOscillators.push({ osc, g, lfo, lfoGain });
-      } else {
-        this.carrierOscillators.push({ osc, g });
-      }
-
-      osc.connect(g).connect(panner).connect(this.nodes.carrierMix);
-      osc.start(0);
-    }
-
-    // (no sub oscillator — it leaks through band filters and causes drone)
-
-    // Noise source — for breath/sibilance
-    if (noiseOn) {
-      const noiseSrc = this.ctx.createBufferSource();
-      noiseSrc.buffer = this._makeNoise(2);
-      noiseSrc.loop = true;
-      const noiseHP = this.ctx.createBiquadFilter();
-      noiseHP.type = 'highpass';
-      noiseHP.frequency.value = 4000;
-      const noiseG = this.ctx.createGain();
-      noiseG.gain.value = noiseLevel * 0.6;
-      noiseSrc.connect(noiseHP).connect(noiseG).connect(this.nodes.carrierMix);
-      noiseSrc.start(0);
-      this.nodes.noiseSrc = noiseSrc;
-    }
-
-    // ── Band bank: carrier → BP filter → VCA → sum ──
-    // Gains are driven by the worklet envelope, not the JS rAF loop.
-    this.nodes.bandSum = this.ctx.createGain();
-    this.nodes.bandSum.gain.value = 1.2;
-
-    for (let i = 0; i < NUM_BANDS; i++) {
-      const freq = bandFreqs[i];
-      const Q = freq < 500 ? 2.5 : freq < 2000 ? 3.5 : 5.0;
-      const bp = this.ctx.createBiquadFilter();
-      bp.type = 'bandpass';
-      bp.frequency.value = freq;
-      bp.Q.value = Q;
-      const vca = this.ctx.createGain();
-      vca.gain.value = 0;
-      this.nodes.carrierMix.connect(bp);
-      bp.connect(vca);
-      vca.connect(this.nodes.bandSum);
-      const bw = freq / Q;
-      this.bandBank.push({ vca, freq, low: freq - bw / 2, high: freq + bw / 2 });
-    }
-
     // Master chain
     this.nodes.masterGain = this.ctx.createGain();
-    this.nodes.masterGain.gain.value = dbToGain(vol);
+    this.nodes.masterGain.gain.value = 1.0;
 
     this.nodes.comp = this.ctx.createDynamicsCompressor();
-    this.nodes.comp.threshold.value = -18;
+    this.nodes.comp.threshold.value = -12;
     this.nodes.comp.knee.value = 6;
     this.nodes.comp.ratio.value = 4;
     this.nodes.comp.attack.value = 0.003;
@@ -1447,7 +1583,7 @@ registerProcessor('vocoder-worklet', VocoderWorklet);
     this.nodes.vuAnalyser = this.ctx.createAnalyser();
     this.nodes.vuAnalyser.fftSize = 256;
 
-    this.nodes.bandSum.connect(this.nodes.masterGain);
+    this.nodes.lpcWorklet.connect(this.nodes.masterGain);
     this.nodes.masterGain.connect(this.nodes.comp);
 
     if (reverbOn) {
@@ -1484,7 +1620,7 @@ registerProcessor('vocoder-worklet', VocoderWorklet);
     });
     try { if (this.nodes.src) this.nodes.src.stop(); } catch(e){}
     try { if (this.nodes.noiseSrc) this.nodes.noiseSrc.stop(); } catch(e){}
-    try { if (this.nodes.modWorklet) this.nodes.modWorklet.disconnect(); } catch(e){}
+    try { if (this.nodes.lpcWorklet) this.nodes.lpcWorklet.disconnect(); } catch(e){}
     Object.values(this.nodes).forEach(n => { if (n && n.disconnect) try { n.disconnect(); } catch(e){} });
     this.nodes = {};
     this.carrierOscillators = [];
@@ -1496,83 +1632,50 @@ registerProcessor('vocoder-worklet', VocoderWorklet);
   setPitch(midi) {
     if (!this.isPlaying) return;
     const freq = mToF(midi);
-    this.carrierOscillators.forEach(({ osc }, i) => {
-      // last entry is sub — halve frequency
-      const isLast = i === this.carrierOscillators.length - 1;
-      osc.frequency.setTargetAtTime(isLast ? freq / 2 : freq, this.ctx.currentTime, 0.05);
-    });
+    if (this.nodes.lpcWorklet) {
+      this.nodes.lpcWorklet.port.postMessage({ pitch: freq });
+    }
   }
 
   setVolume(db) {
     if (this.nodes.masterGain) {
       this.nodes.masterGain.gain.setTargetAtTime(dbToGain(db), this.ctx.currentTime, 0.1);
     }
+    if (this.nodes.lpcWorklet) {
+      this.nodes.lpcWorklet.port.postMessage({ vol: dbToGain(db) });
+    }
   }
 
   processFrame(tiltFactor) {
     if (!this.isPlaying) return;
 
-    // ── Apply worklet envelope to VCAs ──
-    // _lastEnv is updated at ~sample rate by the AudioWorklet, so these
-    // gains reflect the actual voice envelope at audio-thread resolution,
-    // not the 60fps JS approximation.
-    const env = this._lastEnv;
-    if (env && env.length === this.bandBank.length) {
-      let peakEnv = 1e-10;
-      for (let i = 0; i < env.length; i++) peakEnv = Math.max(peakEnv, env[i]);
+    // LPC worklet handles all audio processing — we just need display data here.
+    // Push tilt to worklet (spectral tilt doesn't apply to LPC the same way,
+    // but we can use it to brighten/darken the carrier by sending it as a param).
+    // For now tilt is cosmetic — the LPC filter itself captures the spectral shape.
 
-      const formantPeaks = [];
+    // Keep rawFFT updated for spectrum visualizer
+    if (this.rawFFT && this.nodes.analyser) {
+      this.nodes.analyser.getFloatFrequencyData(this.rawFFT);
+      // Derive visualData from FFT for the spectrum display
+      const binRes = this.ctx.sampleRate / this.nodes.analyser.fftSize;
       this.visualData = [];
-
-      // Overall voice activity gate — if the whole signal is quiet, close all VCAs hard
-      const voiceActive = peakEnv > 0.002;
-
-      for (let idx = 0; idx < this.bandBank.length; idx++) {
-        const band = this.bandBank[idx];
-        let normalized = voiceActive ? env[idx] / peakEnv : 0;
-
-        // Spectral tilt
-        if (normalized > 0 && tiltFactor !== 1.0) {
-          const octAbove = Math.log2(Math.max(band.freq, 1) / 1000);
-          normalized *= Math.pow(10, (octAbove * (tiltFactor - 1.0) * 6) / 10);
-          normalized = clamp(normalized, 0, 1);
-        }
-
-        // Hard gate — bands below 3% of peak get fully closed.
-        // This prevents carrier bleed from ringing biquads summing into a drone.
-        if (normalized < 0.03) normalized = 0;
-
-        if (normalized === 0) {
-          band.vca.gain.setTargetAtTime(0, this.ctx.currentTime, 0.008);
-        } else {
-          band.vca.gain.setTargetAtTime(normalized, this.ctx.currentTime, 0.005);
-        }
-        this.visualData.push(normalized);
-
-        if (normalized > 0.15) formantPeaks.push({ freq: band.freq, mag: normalized });
+      const NUM_VIS = 32;
+      for (let i = 0; i < NUM_VIS; i++) {
+        const freq = 80 * Math.pow(8000 / 80, i / (NUM_VIS - 1));
+        const bin = Math.round(freq / binRes);
+        const db = this.rawFFT[Math.min(bin, this.rawFFT.length - 1)];
+        const norm = clamp((db + 80) / 80, 0, 1);
+        this.visualData.push(norm);
       }
-
-      // Formant extraction
-      formantPeaks.sort((a, b) => b.mag - a.mag);
-      const picked = [];
-      for (const p of formantPeaks) {
-        if (picked.every(q => Math.abs(Math.log2(p.freq / q.freq)) > 0.5)) {
-          picked.push(p);
-          if (picked.length === 3) break;
-        }
-      }
-      picked.sort((a, b) => a.freq - b.freq);
-      this.formants.f1 = picked[0]?.freq || 0;
-      this.formants.f2 = picked[1]?.freq || 0;
-      this.formants.f3 = picked[2]?.freq || 0;
-      this._detectVowel();
     }
 
-    // Scope data (for display)
-    if (this.scopeData) this.nodes.scopeAnalyser.getFloatFrequencyData(this.scopeData);
+    if (this.scopeData && this.nodes.scopeAnalyser) {
+      this.nodes.scopeAnalyser.getFloatFrequencyData(this.scopeData);
+    }
 
-    // Pitch tracking via autocorrelation on time-domain source signal
-    if (this._pitchBuf) {
+    // Pitch tracking via autocorrelation on source signal (for MIDI export)
+    if (this._pitchBuf && this.nodes.pitchAnalyser) {
       this.nodes.pitchAnalyser.getFloatTimeDomainData(this._pitchBuf);
       const pbuf = this._pitchBuf;
       const psr  = this.ctx.sampleRate;
@@ -1598,15 +1701,38 @@ registerProcessor('vocoder-worklet', VocoderWorklet);
       }
     }
 
-    // VU level
-    const td = new Float32Array(256);
-    this.nodes.vuAnalyser.getFloatTimeDomainData(td);
-    let rmsSum = 0;
-    for (let i = 0; i < td.length; i++) rmsSum += td[i] * td[i];
-    this.vuLevel = Math.sqrt(rmsSum / td.length);
+    // VU from worklet RMS (set via port message in build())
+    // vuLevel is already updated by the worklet port message handler
 
-    // Keep rawFFT updated for visualizer spectrum mode
-    if (this.rawFFT) this.nodes.analyser.getFloatFrequencyData(this.rawFFT);
+    // Formant display — derive from FFT of the source (approximate)
+    const binRes2 = this.ctx.sampleRate / this.nodes.analyser.fftSize;
+    let formantPeaks = [];
+    if (this.rawFFT) {
+      const ranges = [[200, 1200], [700, 3000], [1500, 4000]];
+      for (const [lo, hi] of ranges) {
+        let peakDb = -Infinity, peakFreq = 0;
+        const startBin = Math.floor(lo / binRes2);
+        const endBin   = Math.min(Math.ceil(hi / binRes2), this.rawFFT.length - 1);
+        for (let j = startBin; j <= endBin; j++) {
+          if (this.rawFFT[j] > peakDb) { peakDb = this.rawFFT[j]; peakFreq = j * binRes2; }
+        }
+        if (peakDb > -80) formantPeaks.push({ freq: peakFreq, mag: peakDb });
+      }
+    }
+    formantPeaks.sort((a, b) => a.freq - b.freq);
+    this.formants.f1 = formantPeaks[0]?.freq || 0;
+    this.formants.f2 = formantPeaks[1]?.freq || 0;
+    this.formants.f3 = formantPeaks[2]?.freq || 0;
+    this._detectVowel();
+
+    // VU from vuAnalyser as fallback
+    if (this.nodes.vuAnalyser) {
+      const td = new Float32Array(256);
+      this.nodes.vuAnalyser.getFloatTimeDomainData(td);
+      let rmsSum = 0;
+      for (let i = 0; i < td.length; i++) rmsSum += td[i] * td[i];
+      this.vuLevel = Math.sqrt(rmsSum / td.length);
+    }
   }
 
   _detectVowel() {
@@ -2082,14 +2208,14 @@ class UIController {
       { id: 'vol', label: 'MASTER OUT', min: -24, max: 12, value: 0, step: 1, unit: ' dB',
         format: v => (v > 0 ? '+' : '') + v, onChange: v => { this.engine.params.vol = v; this.engine.setVolume(v); this._clearAuto('vol'); } },
       { id: 'detune', label: 'DETUNE', min: 0, max: 50, value: 15, step: 1, unit: ' ¢',
-        format: v => v, onChange: v => this.engine.params.detune = v },
+        format: v => v, onChange: v => { this.engine.params.detune = v; if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ detune: v }); } },
       { id: 'formantShift', label: 'FORMANT', min: -12, max: 12, value: 0, step: 1, unit: ' st',
         format: v => (v > 0 ? '+' : '') + v, onChange: v => this.engine.params.formantShift = v },
       { id: 'reverbMix', label: 'REVERB', min: 0, max: 1, value: 0.25, step: 0.05, unit: '',
         format: v => Math.round(v * 100) + '%', onChange: v => { this.engine.params.reverbMix = v;
           if (this.engine.nodes.reverbGain) this.engine.nodes.reverbGain.gain.setTargetAtTime(v, this.engine.ctx.currentTime, 0.05); } },
       { id: 'vibratoDepth', label: 'VIBRATO', min: 0, max: 50, value: 8, step: 1, unit: ' ¢',
-        format: v => v, onChange: v => this.engine.params.vibratoDepth = v },
+        format: v => v, onChange: v => { this.engine.params.vibratoDepth = v; if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ vibratoDepth: v }); } },
     ];
 
     defs.forEach(def => {
@@ -2187,6 +2313,7 @@ class UIController {
         btn.classList.add('active');
         this.engine.params.waveType = btn.dataset.wave;
         document.getElementById('oscLabel').textContent = btn.textContent;
+        if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ waveType: btn.dataset.wave });
       });
     });
 
@@ -2197,12 +2324,13 @@ class UIController {
         btn.classList.add('active');
         this.engine.params.unison = parseInt(btn.dataset.v);
         document.getElementById('unisonLabel').textContent = btn.dataset.v;
+        if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ unison: parseInt(btn.dataset.v) });
       });
     });
 
     // Toggles
-    this._bindToggle('vibratoToggle', v => this.engine.params.vibratoOn = v);
-    this._bindToggle('noiseToggle',   v => this.engine.params.noiseOn = v, true);
+    this._bindToggle('vibratoToggle', v => { this.engine.params.vibratoOn = v; if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ vibratoOn: v }); });
+    this._bindToggle('noiseToggle',   v => { this.engine.params.noiseOn = v;   if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ noiseOn: v }); }, true);
     this._bindToggle('reverbToggle',  v => this.engine.params.reverbOn = v, true);
     this._bindToggle('formantLockToggle', v => this.engine.params.formantLock = v);
 
