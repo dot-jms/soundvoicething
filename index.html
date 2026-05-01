@@ -1389,15 +1389,7 @@ registerProcessor('vocoder-worklet', VocoderWorklet);
       osc.start(0);
     }
 
-    // Sub octave for body
-    const subOsc = this.ctx.createOscillator();
-    subOsc.type = 'sine';
-    subOsc.frequency.value = baseFreq / 2;
-    const subG = this.ctx.createGain();
-    subG.gain.value = 0.25;
-    subOsc.connect(subG).connect(this.nodes.carrierMix);
-    subOsc.start(0);
-    this.carrierOscillators.push({ osc: subOsc, g: subG });
+    // (no sub oscillator — it leaks through band filters and causes drone)
 
     // Noise source — for breath/sibilance
     if (noiseOn) {
@@ -1532,19 +1524,29 @@ registerProcessor('vocoder-worklet', VocoderWorklet);
       const formantPeaks = [];
       this.visualData = [];
 
+      // Overall voice activity gate — if the whole signal is quiet, close all VCAs hard
+      const voiceActive = peakEnv > 0.002;
+
       for (let idx = 0; idx < this.bandBank.length; idx++) {
         const band = this.bandBank[idx];
-        let normalized = env[idx] / peakEnv;
+        let normalized = voiceActive ? env[idx] / peakEnv : 0;
 
         // Spectral tilt
-        if (tiltFactor !== 1.0) {
+        if (normalized > 0 && tiltFactor !== 1.0) {
           const octAbove = Math.log2(Math.max(band.freq, 1) / 1000);
           normalized *= Math.pow(10, (octAbove * (tiltFactor - 1.0) * 6) / 10);
           normalized = clamp(normalized, 0, 1);
         }
 
-        // Apply to VCA — small time constant to smooth audio-rate updates from rAF
-        band.vca.gain.setTargetAtTime(normalized, this.ctx.currentTime, 0.005);
+        // Hard gate — bands below 3% of peak get fully closed.
+        // This prevents carrier bleed from ringing biquads summing into a drone.
+        if (normalized < 0.03) normalized = 0;
+
+        if (normalized === 0) {
+          band.vca.gain.setTargetAtTime(0, this.ctx.currentTime, 0.008);
+        } else {
+          band.vca.gain.setTargetAtTime(normalized, this.ctx.currentTime, 0.005);
+        }
         this.visualData.push(normalized);
 
         if (normalized > 0.15) formantPeaks.push({ freq: band.freq, mag: normalized });
