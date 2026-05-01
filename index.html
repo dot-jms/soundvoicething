@@ -1095,7 +1095,7 @@ class AudioEngine {
     this.bandBank = [];
     this.carrierOscillators = [];
     this.lfoNode = null;
-    this.NUM_BANDS = 48;
+    this.NUM_BANDS = 24;
     this.rawFFT = null;
     this.isPlaying = false;
     this.visualData = [];
@@ -1214,7 +1214,7 @@ class AudioEngine {
     // Analyser (modulator)
     this.nodes.analyser = this.ctx.createAnalyser();
     this.nodes.analyser.fftSize = 8192;
-    this.nodes.analyser.smoothingTimeConstant = 0.5;
+    this.nodes.analyser.smoothingTimeConstant = 0.15;
     this.rawFFT = new Float32Array(this.nodes.analyser.frequencyBinCount);
 
     // Scope analyser
@@ -1281,35 +1281,73 @@ class AudioEngine {
     subOsc.start(0);
     this.carrierOscillators.push({ osc: subOsc, g: subG });
 
-    // Noise
+    // Static breathiness noise mixed into carrier at low level (always on lightly)
+    // Heavy noise routing now goes through VCA bands for proper fricative shaping
     if (noiseOn) {
       const noiseSrc = this.ctx.createBufferSource();
       noiseSrc.buffer = this._makeNoise(2);
       noiseSrc.loop = true;
       const noiseHP = this.ctx.createBiquadFilter();
       noiseHP.type = 'highpass';
-      noiseHP.frequency.value = 3500;
+      noiseHP.frequency.value = 5000;
       const noiseG = this.ctx.createGain();
-      noiseG.gain.value = noiseLevel;
+      noiseG.gain.value = noiseLevel * 0.3; // quieter — main noise goes through bands
       noiseSrc.connect(noiseHP).connect(noiseG).connect(this.nodes.carrierMix);
       noiseSrc.start(0);
       this.nodes.noiseSrc = noiseSrc;
     }
 
-    // Band bank
+    // Presence boost on carrier: +6dB shelf at 2kHz so high bands have signal to shape
+    this.nodes.carrierPresence = this.ctx.createBiquadFilter();
+    this.nodes.carrierPresence.type = 'highshelf';
+    this.nodes.carrierPresence.frequency.value = 2000;
+    this.nodes.carrierPresence.gain.value = 6;
+    this.nodes.carrierMix.connect(this.nodes.carrierPresence);
+    // Now route carrierPresence output into bands below instead of carrierMix directly
+
+    // Pre-emphasis on modulator: high-shelf +12dB at 1kHz so consonants open bands
+    this.nodes.preEmphasis = this.ctx.createBiquadFilter();
+    this.nodes.preEmphasis.type = 'highshelf';
+    this.nodes.preEmphasis.frequency.value = 1000;
+    this.nodes.preEmphasis.gain.value = 12;
+    this.nodes.analyser.connect(this.nodes.preEmphasis);
+    // preEmphasis only used for envelope measurement — no audio output from it
+
+    // Voiced/unvoiced noise source — routed through vocoder bands for fricatives
+    const fricNoise = this.ctx.createBufferSource();
+    fricNoise.buffer = this._makeNoise(2);
+    fricNoise.loop = true;
+    const fricNoiseHP = this.ctx.createBiquadFilter();
+    fricNoiseHP.type = 'highpass';
+    fricNoiseHP.frequency.value = 1000;
+    fricNoise.connect(fricNoiseHP);
+    fricNoise.start(0);
+    this.nodes.fricNoise = fricNoise;
+    this.nodes.fricNoiseHP = fricNoiseHP;
+
+    // Band bank — 24 bands, single BP per band, frequency-dependent Q
     this.nodes.bandSum = this.ctx.createGain();
-    this.nodes.bandSum.gain.value = 1.0;
+    this.nodes.bandSum.gain.value = 1.5;
+
+    this.NUM_BANDS = 24;
+    this._envState = new Float32Array(this.NUM_BANDS);
 
     for (let i = 0; i < this.NUM_BANDS; i++) {
-      const freq = 80 * Math.pow(16000 / 80, i / (this.NUM_BANDS - 1));
-      const Q = 10;
-      const bp1 = this.ctx.createBiquadFilter();
-      bp1.type = 'bandpass'; bp1.frequency.value = freq; bp1.Q.value = Q;
-      const bp2 = this.ctx.createBiquadFilter();
-      bp2.type = 'bandpass'; bp2.frequency.value = freq; bp2.Q.value = Q;
+      const freq = 80 * Math.pow(8000 / 80, i / (this.NUM_BANDS - 1));
+      // Lower Q at low freqs (vowel body), higher Q at high freqs (consonant detail)
+      const Q = freq < 500 ? 3 : freq < 2000 ? 5 : 8;
+      const bp = this.ctx.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = freq; bp.Q.value = Q;
+
       const vca = this.ctx.createGain();
       vca.gain.value = 0;
-      this.nodes.carrierMix.connect(bp1).connect(bp2).connect(vca).connect(this.nodes.bandSum);
+
+      // Mix carrier (with presence boost) + fricative noise through each band VCA
+      // carrier provides voiced sounds; noise provides fricatives/sibilance
+      this.nodes.carrierPresence.connect(bp);
+      this.nodes.fricNoiseHP.connect(bp);
+      bp.connect(vca).connect(this.nodes.bandSum);
+
       const bw = freq / Q;
       this.bandBank.push({ vca, freq, low: freq - bw / 2, high: freq + bw / 2 });
     }
@@ -1373,6 +1411,7 @@ class AudioEngine {
     });
     try { if (this.nodes.src) this.nodes.src.stop(); } catch(e){}
     try { if (this.nodes.noiseSrc) this.nodes.noiseSrc.stop(); } catch(e){}
+    try { if (this.nodes.fricNoise) this.nodes.fricNoise.stop(); } catch(e){}
     Object.values(this.nodes).forEach(n => { if (n && n.disconnect) try { n.disconnect(); } catch(e){} });
     this.nodes = {};
     this.carrierOscillators = [];
@@ -1403,11 +1442,24 @@ class AudioEngine {
     if (this.scopeData) this.nodes.scopeAnalyser.getFloatFrequencyData(this.scopeData);
 
     const binRes = this.ctx.sampleRate / this.nodes.analyser.fftSize;
-    const attackCoeff = this.params.attackCoeff;
-    const releaseCoeff = this.params.releaseCoeff;
+    // Fast attack for transients (consonants), moderate release so vowels hold
+    const attackCoeff  = 0.85;
+    const releaseCoeff = 0.12;
     this.visualData = [];
 
     let formantPeaks = [];
+
+    // Find global peak energy for normalization
+    let globalPeak = 0;
+    this.bandBank.forEach(band => {
+      const startBin = Math.max(0, Math.floor(band.low / binRes));
+      const endBin   = Math.min(this.rawFFT.length - 1, Math.ceil(band.high / binRes));
+      for (let j = startBin; j <= endBin; j++) {
+        const db = this.rawFFT[j];
+        if (db > -100) globalPeak = Math.max(globalPeak, Math.pow(10, db / 20));
+      }
+    });
+    const normalizer = globalPeak > 0 ? 1 / (globalPeak + 1e-10) : 1;
 
     this.bandBank.forEach((band, idx) => {
       const startBin = Math.max(0, Math.floor(band.low / binRes));
@@ -1421,23 +1473,34 @@ class AudioEngine {
 
       let avgEnergy = binCount > 0 ? totalEnergy / binCount : 0;
 
-      // Spectral tilt in dB domain
+      // Spectral tilt
       if (tiltFactor !== 0) {
         const octAbove = Math.log2(Math.max(band.freq, 1) / 500);
         const tiltGain = octAbove * tiltFactor * 2;
         avgEnergy *= Math.pow(10, tiltGain / 20);
       }
 
-      let rawGain = clamp(avgEnergy * 8, 0, 1);
+      // Boost high bands for consonant intelligibility (pre-emphasis on envelope)
+      const hiBoost = band.freq > 1000 ? Math.min(3.0, Math.log2(band.freq / 1000) + 1) : 1.0;
+      avgEnergy *= hiBoost;
+
+      // Normalize relative to loudest band, scale to useful range
+      let rawGain = clamp(avgEnergy * normalizer * 4, 0, 1);
+
+      // Expansion: sharpen contrast between loud and quiet bands so quiet bands
+      // don't muddy the output (soft knee expander)
+      rawGain = rawGain > 0.15 ? rawGain : rawGain * rawGain * 4;
+
       const prev = this._envState[idx];
       const coeff = rawGain > prev ? attackCoeff : releaseCoeff;
       const smoothed = prev + coeff * (rawGain - prev);
       this._envState[idx] = smoothed;
 
-      band.vca.gain.setTargetAtTime(smoothed, this.ctx.currentTime, 0.03);
+      // Faster setTargetAtTime for snappier VCA response
+      band.vca.gain.setTargetAtTime(smoothed, this.ctx.currentTime, 0.008);
       this.visualData.push(smoothed);
 
-      if (smoothed > 0.15) formantPeaks.push({ freq: band.freq, mag: smoothed });
+      if (smoothed > 0.1) formantPeaks.push({ freq: band.freq, mag: smoothed });
     });
 
     // Formant extraction: find top 3 peaks
