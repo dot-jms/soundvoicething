@@ -1219,7 +1219,7 @@ class AudioEngine {
     //   4. Filter carrier through LPC synthesis filter
     //   5. Output synthesized speech
 
-    const LPC_ORDER = 16; // 16 poles captures vocal tract well for speech
+    const LPC_ORDER = 20; // kept for lpcParams reference — matches LPC_ORDER_NEW below
     const lpcParams = {
       pitch:       mToF(pitch),
       waveType:    waveType,
@@ -1233,60 +1233,110 @@ class AudioEngine {
       vol:         dbToGain(vol),
     };
 
-    // ── Offline LPC pre-analysis ──
-    // Since we have the full audio buffer upfront, we can analyze ALL frames
-    // before playback starts. This gives us:
-    // 1. No frame-chasing or interpolation lag during playback
-    // 2. Better analysis quality (we can use longer frames, better windowing)
-    // 3. Exact timing — the worklet just indexes into the frame table
-    const LPC_FRAME_MS  = 25;   // 25ms analysis window
-    const LPC_HOP_MS    = 5;    // 5ms hop — tighter than real-time could afford
-    const PREEMPH_ALPHA = 0.97;
+    // ── Offline pre-analysis ──
+    // We have the full buffer — analyze everything upfront at maximum quality.
+    // Shorter frames (15ms) for temporal resolution, higher order (20) for spectral detail,
+    // tighter hop (4ms) for smooth transitions, plus per-frame pitch tracking.
+    const LPC_ORDER_NEW  = 20;    // more poles = better formant detail
+    const LPC_FRAME_MS   = 15;    // shorter = catches fast consonants better
+    const LPC_HOP_MS     = 4;     // 4ms hop = 250 frames/sec — very fine-grained
+    const PREEMPH_ALPHA  = 0.97;
+    const MIN_PITCH_HZ   = 60;
+    const MAX_PITCH_HZ   = 500;
 
-    const sr         = this.ctx.sampleRate;
-    const frameSize  = Math.round(sr * LPC_FRAME_MS / 1000);
-    const hopSize    = Math.round(sr * LPC_HOP_MS   / 1000);
-    const audioBuf   = this.audioBuffer;
-    const srcData    = audioBuf.getChannelData(0);
+    const sr           = this.ctx.sampleRate;
+    const frameSize    = Math.round(sr * LPC_FRAME_MS / 1000);
+    const hopSize      = Math.round(sr * LPC_HOP_MS   / 1000);
+    const audioBuf     = this.audioBuffer;
+    const srcData      = audioBuf.getChannelData(0);
     const totalSamples = srcData.length;
-    const numFrames  = Math.floor((totalSamples - frameSize) / hopSize) + 1;
+    const numFrames    = Math.floor((totalSamples - frameSize) / hopSize) + 1;
 
-    // Pre-emphasis pass on the whole signal
+    // Pre-emphasis on the whole signal
     const preEmph = new Float32Array(totalSamples);
     preEmph[0] = srcData[0];
     for (let i = 1; i < totalSamples; i++)
       preEmph[i] = srcData[i] - PREEMPH_ALPHA * srcData[i - 1];
 
-    // Levinson-Durbin on one frame — returns { coeffs, gain, voiced, rms }
+    // ── Per-frame analysis: LPC + pitch + V/UV ──
     const analyzeFrame = (startSample) => {
-      const p = LPC_ORDER;
-      // Hann window
+      const p = LPC_ORDER_NEW;
+
+      // Hann-windowed pre-emphasized frame for LPC
       const w = new Float32Array(frameSize);
       for (let i = 0; i < frameSize; i++) {
-        const s = startSample + i < totalSamples ? preEmph[startSample + i] : 0;
+        const idx = startSample + i;
+        const s = idx < totalSamples ? preEmph[idx] : 0;
         w[i] = s * (0.5 - 0.5 * Math.cos(6.283185307 * i / (frameSize - 1)));
       }
 
-      // RMS and ZCR on the *original* (non-pre-emphasized) signal for V/UV
+      // Energy + ZCR on original signal for V/UV
       let energy = 0, zcr = 0;
       for (let i = 0; i < frameSize; i++) {
-        const s = startSample + i < totalSamples ? srcData[startSample + i] : 0;
+        const idx = startSample + i;
+        const s    = idx < totalSamples ? srcData[idx] : 0;
+        const prev = idx > 0 ? srcData[idx - 1] : 0;
         energy += s * s;
-        if (i > 0) {
-          const prev = startSample + i - 1 < totalSamples ? srcData[startSample + i - 1] : 0;
-          if ((s >= 0) !== (prev >= 0)) zcr++;
-        }
+        if (i > 0 && (s >= 0) !== (prev >= 0)) zcr++;
       }
-      const rms = Math.sqrt(energy / frameSize);
+      const rms     = Math.sqrt(energy / frameSize);
       const zcrNorm = zcr / frameSize;
 
-      // Voiced/unvoiced: use both ZCR and autocorrelation peak
-      let voiced = 0;
-      if (rms > 0.003) {
-        voiced = zcrNorm < 0.12 ? 1 : zcrNorm > 0.28 ? 0 : (0.28 - zcrNorm) / 0.16;
+      // ── Pitch detection via YIN on a longer window (40ms for accuracy) ──
+      // YIN uses the difference function to find the fundamental period.
+      // Running it on 40ms gives better frequency resolution for low voices.
+      const pitchWinSize = Math.round(sr * 0.040);
+      const maxLag = Math.round(sr / MIN_PITCH_HZ);
+      const minLag = Math.round(sr / MAX_PITCH_HZ);
+      let detectedPitch = 0, pitchConf = 0;
+
+      if (rms > 0.004 && zcrNorm < 0.25) {
+        // Build difference function d[tau]
+        const d = new Float32Array(maxLag + 1);
+        for (let tau = 1; tau <= maxLag; tau++) {
+          let sum = 0;
+          const lim = Math.min(pitchWinSize, totalSamples - startSample - tau);
+          for (let i = 0; i < lim; i++) {
+            const diff = srcData[startSample + i] - srcData[startSample + i + tau];
+            sum += diff * diff;
+          }
+          d[tau] = sum;
+        }
+        // Cumulative mean normalized difference function d'[tau]
+        const dn = new Float32Array(maxLag + 1);
+        dn[0] = 1;
+        let cumSum = 0;
+        for (let tau = 1; tau <= maxLag; tau++) {
+          cumSum += d[tau];
+          dn[tau] = cumSum > 0 ? d[tau] * tau / cumSum : 1;
+        }
+        // Find first dip below threshold 0.12 in range [minLag, maxLag]
+        let bestTau = -1, bestVal = 0.12;
+        for (let tau = minLag; tau <= maxLag; tau++) {
+          if (dn[tau] < bestVal) {
+            // Parabolic interpolation for sub-sample accuracy
+            const x0 = tau > 0     ? dn[tau-1] : dn[tau];
+            const x2 = tau < maxLag ? dn[tau+1] : dn[tau];
+            const correction = (x2 - x0) / (2 * (2*dn[tau] - x0 - x2) + 1e-10);
+            bestTau = tau + correction;
+            bestVal = dn[tau];
+          }
+        }
+        if (bestTau > 0) {
+          detectedPitch = sr / bestTau;
+          pitchConf     = 1 - bestVal; // higher = more confident
+        }
       }
 
-      // Autocorrelation
+      // Voiced/unvoiced: combine ZCR, energy, and pitch confidence
+      let voiced = 0;
+      if (rms > 0.003) {
+        const zcrScore   = zcrNorm < 0.12 ? 1 : zcrNorm > 0.28 ? 0 : (0.28 - zcrNorm) / 0.16;
+        const pitchScore = pitchConf > 0.5 ? 1 : pitchConf * 2;
+        voiced = Math.min(1, (zcrScore * 0.4 + pitchScore * 0.6));
+      }
+
+      // ── Levinson-Durbin LPC ──
       const r = new Float32Array(p + 1);
       for (let lag = 0; lag <= p; lag++) {
         let s = 0;
@@ -1294,15 +1344,16 @@ class AudioEngine {
         r[lag] = s;
       }
 
-      if (r[0] < 1e-12) return { coeffs: new Float32Array(p), gain: rms, voiced, rms };
+      if (r[0] < 1e-12) {
+        return { coeffs: new Float32Array(p), gain: 0, voiced, rms, pitch: detectedPitch };
+      }
 
-      // Bandwidth expansion (gamma = 0.994 per lag)
+      // Bandwidth expansion gamma = 0.992 (slightly tighter than before — keeps formants crisp)
       let g = 1.0;
-      for (let k = 1; k <= p; k++) { g *= 0.994; r[k] *= g; }
+      for (let k = 1; k <= p; k++) { g *= 0.992; r[k] *= g; }
       r[0] *= 1.0002;
 
-      // Levinson-Durbin
-      const a = new Float32Array(p + 1);
+      const a   = new Float32Array(p + 1);
       const tmp = new Float32Array(p + 1);
       let err = r[0];
       for (let m = 1; m <= p; m++) {
@@ -1312,78 +1363,109 @@ class AudioEngine {
         for (let j = 1; j < m; j++) tmp[j] = a[j];
         for (let j = 1; j < m; j++) a[j] = tmp[j] + k * tmp[m - j];
         a[m] = k;
-        err *= (1 - k * k);
+        err  *= (1 - k * k);
         if (err < 1e-20) break;
       }
 
       const coeffs = new Float32Array(p);
       for (let i = 0; i < p; i++) coeffs[i] = -a[i + 1];
 
-      // Gain: normalize so synthesis output tracks input RMS
-      // gain = sqrt(prediction error) * (rms / sqrt(r[0])) scales output to input level
+      // Gain normalized to input RMS — output level tracks voice dynamics
       const predErr = Math.sqrt(Math.max(0, err));
-      const gain = rms > 0.001 ? (predErr * rms / (Math.sqrt(r[0]) + 1e-9)) : 0;
+      const gain    = rms > 0.001 ? rms / (predErr / Math.sqrt(r[0]) + 1e-9) * 0.5 : 0;
 
-      return { coeffs, gain, voiced, rms };
+      return { coeffs, gain, voiced, rms, pitch: detectedPitch };
     };
 
-    // Analyze all frames — this runs synchronously before playback
-    // At 44100Hz, 5ms hop = 220 samples/hop, ~200 frames/sec
-    // For a 30s recording: ~6000 frames × 16 coeffs = ~96000 floats — trivial
-    // Show analysis progress in UI
     const statusPill = document.getElementById('statusPill');
     if (statusPill) { statusPill.textContent = 'ANALYZING…'; statusPill.className = 'pill pill-armed'; }
 
-    console.log(`LPC pre-analysis: ${numFrames} frames × ${LPC_ORDER} poles...`);
-    const frameCoeffs  = new Array(numFrames);  // Float32Array per frame
-    const frameGains   = new Float32Array(numFrames);
-    const frameVoiced  = new Float32Array(numFrames);
-    const frameRms     = new Float32Array(numFrames);
+    const frameCoeffs = new Array(numFrames);
+    const frameGains  = new Float32Array(numFrames);
+    const frameVoiced = new Float32Array(numFrames);
+    const framePitch  = new Float32Array(numFrames);  // per-frame detected pitch (Hz), 0 = unvoiced
 
     for (let f = 0; f < numFrames; f++) {
-      const { coeffs, gain, voiced, rms } = analyzeFrame(f * hopSize);
-      frameCoeffs[f] = coeffs;
-      frameGains[f]  = gain;
-      frameVoiced[f] = voiced;
-      frameRms[f]    = rms;
+      const res = analyzeFrame(f * hopSize);
+      frameCoeffs[f]  = res.coeffs;
+      frameGains[f]   = res.gain;
+      frameVoiced[f]  = res.voiced;
+      framePitch[f]   = res.pitch;
     }
-    console.log(`LPC pre-analysis complete.`);
+
+    // ── Pitch smoothing pass ──
+    // Median-filter the pitch track over ±3 frames to remove octave jumps,
+    // then low-pass smooth it so pitch glides rather than stepping.
+    const smoothedPitch = new Float32Array(numFrames);
+    for (let f = 0; f < numFrames; f++) {
+      // Collect voiced-only pitches in window
+      const win = [];
+      for (let k = Math.max(0, f-3); k <= Math.min(numFrames-1, f+3); k++) {
+        if (framePitch[k] > 0) win.push(framePitch[k]);
+      }
+      if (win.length > 0) {
+        win.sort((a, b) => a - b);
+        smoothedPitch[f] = win[Math.floor(win.length / 2)];
+      }
+    }
+    // Low-pass smooth: exponential moving average forward and backward
+    let prev = 0;
+    for (let f = 0; f < numFrames; f++) {
+      if (smoothedPitch[f] > 0) {
+        prev = prev === 0 ? smoothedPitch[f] : prev * 0.7 + smoothedPitch[f] * 0.3;
+        smoothedPitch[f] = prev;
+      } else {
+        smoothedPitch[f] = prev; // hold last voiced pitch through unvoiced regions
+      }
+    }
+
     if (statusPill) { statusPill.textContent = 'READY'; statusPill.className = 'pill pill-ready'; }
 
-    // Flatten frame data for transfer to worklet
-    // Layout: [frame0_c0..c15, frame1_c0..c15, ...]
-    const flatCoeffs = new Float32Array(numFrames * LPC_ORDER);
+    // Flatten for transfer
+    const flatCoeffs = new Float32Array(numFrames * LPC_ORDER_NEW);
     for (let f = 0; f < numFrames; f++)
-      flatCoeffs.set(frameCoeffs[f], f * LPC_ORDER);
+      flatCoeffs.set(frameCoeffs[f], f * LPC_ORDER_NEW);
 
     const workletCode = `
 class LPCVocoderWorklet extends AudioWorkletProcessor {
   constructor(options) {
     super();
-    const p = options.processorOptions;
-    this.sr      = sampleRate;
-    this.order   = ${LPC_ORDER};
-    this.hopSize = ${hopSize};
+    const p       = options.processorOptions;
+    this.sr       = sampleRate;
+    this.order    = ${LPC_ORDER_NEW};
+    this.hopSize  = ${hopSize};
 
-    // Pre-analyzed LPC frame tables (transferred from main thread)
-    this.frameCoeffs = p.flatCoeffs;   // Float32Array, length = numFrames * order
-    this.frameGains  = p.frameGains;   // Float32Array, length = numFrames
-    this.frameVoiced = p.frameVoiced;  // Float32Array
-    this.numFrames   = p.numFrames;
-    this.totalSamples = p.totalSamples;
+    // Frame tables — arrive via port
+    this.frameCoeffs   = null;
+    this.frameGains    = null;
+    this.frameVoiced   = null;
+    this.framePitch    = null;  // per-frame detected pitch (Hz)
+    this.numFrames     = p.numFrames;
+    this.totalSamples  = p.totalSamples;
+    this.ready         = false;
 
-    // Current position in the source audio (samples)
-    this.samplePos = 0;
+    this.samplePos     = 0;
+    this.synthDelay    = new Float32Array(this.order);
+    this.deEmphPrev    = 0;
+    this.deEmphAlpha   = ${PREEMPH_ALPHA};
 
-    // Synthesis filter delay line
-    this.synthDelay = new Float32Array(this.order);
+    // Per-sample interpolated state (updated at block boundaries)
+    this.curCoeffs  = new Float32Array(this.order);
+    this.curGain    = 0;
+    this.curVoiced  = 0;
+    this.curPitch   = p.pitch; // Hz — starts at user-set pitch, transitions to tracked
 
-    // De-emphasis filter state
-    this.deEmphPrev = 0;
-    this.deEmphAlpha = ${PREEMPH_ALPHA};
+    // Per-sample deltas (avoids per-sample division/multiply in inner loop)
+    this.dCoeffs  = new Float32Array(this.order);
+    this.dGain    = 0;
+    this.dVoiced  = 0;
+    this.dPitch   = 0;
+    this.stepPos  = 0; // samples since last frame update
+    this.lastFrameIdx = -1;
 
-    // Carrier state
-    this.pitch        = p.pitch;
+    // User params
+    this.userPitch    = p.pitch;   // Hz — used when no pitch detected
+    this.pitchScale   = 1.0;       // multiplier so user can transpose
     this.waveType     = p.waveType;
     this.unison       = Math.max(1, p.unison);
     this.detune       = p.detune;
@@ -1399,21 +1481,24 @@ class LPCVocoderWorklet extends AudioWorkletProcessor {
     for (let i = 0; i < this.unison; i++) this.unisonPhases[i] = i / this.unison;
 
     this.ns = (Math.random() * 0xffffffff) >>> 0;
-
-    // Current interpolated LPC state
-    this.curCoeffs = new Float32Array(this.order);
-    this.curGain   = 0;
-    this.curVoiced = 0;
-
-    // Previous frame index for interpolation
-    this.prevFrameIdx = -1;
-
     this.displayCounter = 0;
 
     this.port.onmessage = (e) => {
       if (!e.data) return;
       const d = e.data;
-      if (d.pitch        !== undefined) this.pitch        = d.pitch;
+      if (d.init) {
+        this.frameCoeffs = d.flatCoeffs;
+        this.frameGains  = d.frameGains;
+        this.frameVoiced = d.frameVoiced;
+        this.framePitch  = d.framePitch;
+        // Initialize curPitch from first voiced frame
+        for (let f = 0; f < this.numFrames; f++) {
+          if (this.framePitch[f] > 0) { this.curPitch = this.framePitch[f]; break; }
+        }
+        this.ready = true;
+        return;
+      }
+      if (d.pitch        !== undefined) this.userPitch    = d.pitch;
       if (d.waveType     !== undefined) this.waveType     = d.waveType;
       if (d.detune       !== undefined) this.detune       = d.detune;
       if (d.noiseOn      !== undefined) this.noiseOn      = d.noiseOn;
@@ -1436,27 +1521,28 @@ class LPCVocoderWorklet extends AudioWorkletProcessor {
     return (x / 2147483648) - 1.0;
   }
 
+  // LF glottal pulse — asymmetric, matches real vocal fold motion
   _glottalSample(ph) {
-    const Tp = 0.40, Te = 0.76, Ta = 0.06;
-    if (ph < Tp) {
-      return Math.sin(3.14159265 * ph / Tp);
-    } else if (ph < Te) {
-      const t = (ph - Tp) / (Te - Tp);
-      return Math.cos(1.5707963 * t);
-    } else if (ph < Te + Ta) {
-      const t = (ph - Te) / Ta;
-      return -0.17 * Math.sin(3.14159265 * t) * Math.exp(-t * 2);
-    }
+    if (ph < 0.40) return Math.sin(3.14159265 * ph / 0.40);
+    if (ph < 0.76) { const t = (ph-0.40)/0.36; return Math.cos(1.5707963 * t); }
+    if (ph < 0.82) { const t = (ph-0.76)/0.06; return -0.17*Math.sin(3.14159265*t)*Math.exp(-t*2); }
     return 0;
   }
 
-  _carrier(voiced) {
+  _carrier(voiced, pitch) {
+    // Vibrato modulates the DETECTED pitch (so it sounds musical, not robotic)
     let pitchMod = 1.0;
     if (this.vibratoOn) {
       this.vibratoPhase = (this.vibratoPhase + this.vibratoRate / this.sr) % 1;
       pitchMod = Math.pow(2, Math.sin(6.283185307 * this.vibratoPhase) * this.vibratoDepth / 1200);
     }
-    const f = this.pitch * pitchMod;
+
+    // Pitch-tracking: follow detected pitch for voiced segments (gives natural inflection),
+    // fall back to userPitch for unvoiced/silence.
+    // The "pitch" knob now acts as a global transpose, not override.
+    const trackPitch = pitch > 0 ? pitch * (this.userPitch / 130.81) : this.userPitch;
+    const f = trackPitch * pitchMod;
+
     const n = this.unison;
     let out = 0;
     for (let v = 0; v < n; v++) {
@@ -1472,71 +1558,84 @@ class LPCVocoderWorklet extends AudioWorkletProcessor {
       out += s;
     }
     out /= n;
+
+    // Smooth voiced/unvoiced blend — avoids hard clicks at V/UV boundaries
     if (voiced < 0.95) out = out * voiced + this._noise() * (1 - voiced);
-    if (this.noiseOn && this.noiseLevel > 0) out += this._noise() * this.noiseLevel * 0.2;
+    if (this.noiseOn && this.noiseLevel > 0) out += this._noise() * this.noiseLevel * 0.15;
     return out;
   }
 
   process(inputs, outputs) {
     const output = outputs[0]?.[0];
     if (!output) return true;
+    if (!this.ready) { output.fill(0); return true; }
 
-    const bs = output.length;
+    const bs    = output.length;
+    const order = this.order;
+    const hop   = this.hopSize;
 
     for (let i = 0; i < bs; i++) {
-      // Which LPC frame does this sample fall in?
-      const frameIdx = Math.min(
-        Math.floor(this.samplePos / this.hopSize),
-        this.numFrames - 1
-      );
+      // Compute current frame index and fractional position
+      const frameIdx = Math.min(Math.floor(this.samplePos / hop), this.numFrames - 1);
 
-      // On frame boundary: update target coefficients
-      if (frameIdx !== this.prevFrameIdx) {
-        this.prevFrameIdx = frameIdx;
-        const base = frameIdx * this.order;
+      // When we cross into a new frame, recompute per-sample deltas
+      // This replaces per-sample lerp math with simple additions
+      if (frameIdx !== this.lastFrameIdx) {
+        this.lastFrameIdx = frameIdx;
+        this.stepPos = this.samplePos - frameIdx * hop;
+        const nextIdx  = Math.min(frameIdx + 1, this.numFrames - 1);
+        const base     = frameIdx * order;
+        const nextBase = nextIdx  * order;
+        const invHop   = 1.0 / hop;
 
-        // Blend between adjacent frames for smooth transitions
-        // t = fractional position within current hop (0..1)
-        const t = (this.samplePos - frameIdx * this.hopSize) / this.hopSize;
-        const nextIdx = Math.min(frameIdx + 1, this.numFrames - 1);
-        const nextBase = nextIdx * this.order;
+        // t at current position
+        const t0 = this.stepPos * invHop;
+        const t1 = Math.min((this.stepPos + 1) * invHop, 1);
 
-        for (let j = 0; j < this.order; j++) {
-          this.curCoeffs[j] = this.frameCoeffs[base + j] * (1 - t)
-                            + this.frameCoeffs[nextBase + j] * t;
+        for (let j = 0; j < order; j++) {
+          const c0 = this.frameCoeffs[base     + j];
+          const c1 = this.frameCoeffs[nextBase + j];
+          this.curCoeffs[j] = c0 + (c1 - c0) * t0;
+          this.dCoeffs[j]   = (c1 - c0) * invHop;
         }
-        this.curGain   = this.frameGains[frameIdx]  * (1 - t) + this.frameGains[nextIdx]  * t;
-        this.curVoiced = this.frameVoiced[frameIdx] * (1 - t) + this.frameVoiced[nextIdx] * t;
-      } else {
-        // Within a frame: linearly interpolate toward next frame
-        const nextIdx = Math.min(frameIdx + 1, this.numFrames - 1);
-        const nextBase = nextIdx * this.order;
-        const base     = frameIdx * this.order;
-        const t = (this.samplePos - frameIdx * this.hopSize) / this.hopSize;
+        const g0 = this.frameGains[frameIdx],  g1 = this.frameGains[nextIdx];
+        const v0 = this.frameVoiced[frameIdx], v1 = this.frameVoiced[nextIdx];
+        const p0 = this.framePitch[frameIdx],  p1 = this.framePitch[nextIdx];
 
-        for (let j = 0; j < this.order; j++) {
-          this.curCoeffs[j] = this.frameCoeffs[base + j] * (1 - t)
-                            + this.frameCoeffs[nextBase + j] * t;
-        }
-        this.curGain   = this.frameGains[frameIdx]  * (1 - t) + this.frameGains[nextIdx]  * t;
-        this.curVoiced = this.frameVoiced[frameIdx] * (1 - t) + this.frameVoiced[nextIdx] * t;
+        this.curGain   = g0 + (g1 - g0) * t0;
+        this.curVoiced = v0 + (v1 - v0) * t0;
+        this.curPitch  = p0 + (p1 - p0) * t0;
+        this.dGain     = (g1 - g0) * invHop;
+        this.dVoiced   = (v1 - v0) * invHop;
+        this.dPitch    = (p1 - p0) * invHop;
       }
 
+      // Step interpolated state forward by one sample (just additions)
+      for (let j = 0; j < order; j++) this.curCoeffs[j] += this.dCoeffs[j];
+      this.curGain   += this.dGain;
+      this.curVoiced += this.dVoiced;
+      this.curPitch  += this.dPitch;
       this.samplePos++;
 
-      // Carrier excitation
-      const exc = this._carrier(this.curVoiced) * Math.max(0, this.curGain);
+      // Excitation
+      const exc = this._carrier(
+        Math.max(0, Math.min(1, this.curVoiced)),
+        Math.max(0, this.curPitch)
+      ) * Math.max(0, this.curGain);
 
-      // All-pole LPC synthesis filter
+      // All-pole LPC synthesis
       let y = exc;
-      for (let j = 0; j < this.order; j++) y += this.curCoeffs[j] * this.synthDelay[j];
-      for (let j = this.order - 1; j > 0; j--) this.synthDelay[j] = this.synthDelay[j-1];
-      this.synthDelay[0] = y;
+      const d = this.synthDelay;
+      const c = this.curCoeffs;
+      for (let j = 0; j < order; j++) y += c[j] * d[j];
+      for (let j = order - 1; j > 0; j--) d[j] = d[j-1];
+      d[0] = y;
 
-      // De-emphasis: restores natural spectral tilt after pre-emphasis analysis
-      y = y + this.deEmphAlpha * this.deEmphPrev;
+      // De-emphasis (undo pre-emphasis boost)
+      y += this.deEmphAlpha * this.deEmphPrev;
       this.deEmphPrev = y;
 
+      // Soft clip
       output[i] = Math.tanh(y * this.vol);
     }
 
@@ -1577,21 +1676,32 @@ registerProcessor('lpc-vocoder', LPCVocoderWorklet);
     this._pitchBuf = new Float32Array(2048);
     this.nodes.src.connect(this.nodes.pitchAnalyser);
 
-    // LPC vocoder worklet — receives pre-analyzed frame tables, generates output
-    // No audio input needed — all analysis was done offline above
+    // LPC vocoder worklet — receives pre-analyzed frame tables, generates output.
+    // We connect a silent ConstantSourceNode as a dummy input because the Web Audio
+    // spec allows browsers to stop calling process() on nodes with no active inputs.
     this.nodes.lpcWorklet = new AudioWorkletNode(this.ctx, 'lpc-vocoder', {
-      numberOfInputs:  0,
+      numberOfInputs:  1,
       numberOfOutputs: 1,
       outputChannelCount: [1],
       processorOptions: {
         ...lpcParams,
-        flatCoeffs:   flatCoeffs,
-        frameGains:   frameGains,
-        frameVoiced:  frameVoiced,
         numFrames:    numFrames,
         totalSamples: totalSamples,
       },
     });
+
+    // Transfer the large arrays via port instead of processorOptions to avoid
+    // structured-clone overhead and ensure typed arrays arrive correctly
+    this.nodes.lpcWorklet.port.postMessage(
+      { init: true, flatCoeffs, frameGains, frameVoiced, framePitch: smoothedPitch },
+      [flatCoeffs.buffer, frameGains.buffer, frameVoiced.buffer, smoothedPitch.buffer]
+    );
+
+    // Silent dummy input to keep process() alive
+    this.nodes.silentSrc = this.ctx.createConstantSource();
+    this.nodes.silentSrc.offset.value = 0;
+    this.nodes.silentSrc.connect(this.nodes.lpcWorklet);
+    this.nodes.silentSrc.start();
 
     // Receive display data from worklet
     this.vuLevel = 0;
@@ -1661,7 +1771,8 @@ registerProcessor('lpc-vocoder', LPCVocoderWorklet);
       if (lfo) try { lfo.stop(); } catch(e){}
     });
     try { if (this.nodes.src) this.nodes.src.stop(); } catch(e){}
-    try { if (this.nodes.noiseSrc) this.nodes.noiseSrc.stop(); } catch(e){}
+    try { if (this.nodes.noiseSrc)   this.nodes.noiseSrc.stop();   } catch(e){}
+    try { if (this.nodes.silentSrc)  this.nodes.silentSrc.stop();  } catch(e){}
     try { if (this.nodes.lpcWorklet) this.nodes.lpcWorklet.disconnect(); } catch(e){}
     Object.values(this.nodes).forEach(n => { if (n && n.disconnect) try { n.disconnect(); } catch(e){} });
     this.nodes = {};
