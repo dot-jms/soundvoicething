@@ -1861,16 +1861,29 @@ registerProcessor('lpc-vocoder', LPCVocoderWorklet);
 
         const rawMidi = (bestLag > 0 && bestVal < 0.25) ? fToM(psr / bestLag) : -1;
 
-        // Median filter over last 5 frames to kill octave jumps and jitter
+        // Median filter over last 9 frames to kill octave jumps and jitter
         if (!this._pitchHistory) this._pitchHistory = [];
         this._pitchHistory.push(rawMidi);
-        if (this._pitchHistory.length > 5) this._pitchHistory.shift();
+        if (this._pitchHistory.length > 9) this._pitchHistory.shift();
 
         // Only use valid (non-silence) readings for median
         const valid = this._pitchHistory.filter(v => v >= 0);
-        if (valid.length >= 2) {
+        if (valid.length >= 3) {
           const sorted = [...valid].sort((a, b) => a - b);
-          this.detectedMidi = sorted[Math.floor(sorted.length / 2)];
+          let median = sorted[Math.floor(sorted.length / 2)];
+
+          // Octave correction: if rawMidi is exactly 12 semitones from median,
+          // it's almost certainly an octave detection error — snap to median octave.
+          // This is the #1 source of pitch instability in autocorrelation detectors.
+          if (rawMidi >= 0) {
+            const diff = rawMidi - median;
+            if (Math.abs(diff - 12) < 1.5) median = rawMidi - 12;
+            else if (Math.abs(diff + 12) < 1.5) median = rawMidi + 12;
+            else if (Math.abs(diff - 24) < 1.5) median = rawMidi - 24;
+            else if (Math.abs(diff + 24) < 1.5) median = rawMidi + 24;
+          }
+
+          this.detectedMidi = median;
         } else {
           this.detectedMidi = rawMidi;
         }
@@ -2112,13 +2125,35 @@ class MidiRecorder {
   // Called every frame with current detected pitch (midi float, or -1 for silence)
   feed(midiFloat, volume) {
     if (!this.isRecording) return;
-    const now = (performance.now() - this.startTime) / 1000;
+    const now  = (performance.now() - this.startTime) / 1000;
     const midi = midiFloat >= 0 ? Math.round(midiFloat) : -1;
-    const vel  = Math.min(127, Math.max(1, Math.round(Math.sqrt(volume) * 180)));
-    if (midi !== this.lastMidi) {
+
+    // Velocity: map RMS (typically 0.01–0.3) to full 1–127 range
+    // Use dB scaling: 20*log10(rms), map -40dB..0dB → 1..127
+    const rms   = Math.max(volume, 1e-6);
+    const db    = 20 * Math.log10(rms);  // typically -40 to 0
+    const vel   = Math.min(127, Math.max(1, Math.round((db + 40) / 40 * 126 + 1)));
+
+    // Stability buffer — require pitch to hold for MIN_STABLE frames before switching
+    const MIN_STABLE    = 3;   // ~50ms at 60fps — ignores single-frame blips
+    const MIN_NOTE_DUR  = 0.08; // 80ms minimum note duration — kills <50ms phantom notes
+
+    if (!this._stableBuf) this._stableBuf = [];
+    this._stableBuf.push(midi);
+    if (this._stableBuf.length > MIN_STABLE) this._stableBuf.shift();
+
+    // A pitch is "stable" if the last MIN_STABLE frames all agree
+    const allSame = this._stableBuf.length === MIN_STABLE &&
+                    this._stableBuf.every(v => v === this._stableBuf[0]);
+    const stableMidi = allSame ? this._stableBuf[0] : this.lastMidi; // hold current if unstable
+
+    if (stableMidi !== this.lastMidi) {
+      // Minimum duration gate: don't close a note that just opened
+      if (this.lastMidi >= 0 && (now - this.lastOnTime) < MIN_NOTE_DUR) return;
+
       if (this.lastMidi >= 0) this._noteOff(this.lastMidi, now);
-      if (midi >= 0) { this._noteOn(midi, vel, now); this.lastOnTime = now; }
-      this.lastMidi = midi;
+      if (stableMidi >= 0)    { this._noteOn(stableMidi, vel, now); this.lastOnTime = now; }
+      this.lastMidi = stableMidi;
     }
   }
 
