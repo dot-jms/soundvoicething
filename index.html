@@ -1291,6 +1291,12 @@ class LPCVocoderWorklet extends AudioWorkletProcessor {
     // Fast noise state
     this.ns = (Math.random() * 0xffffffff) >>> 0;
 
+    // De-emphasis filter state (undoes pre-emphasis on output)
+    // Pre-emphasis:  y[n] = x[n] - 0.97*x[n-1]   (applied before LPC analysis)
+    // De-emphasis:   y[n] = x[n] + 0.97*y[n-1]   (applied after synthesis)
+    // These cancel out so the final output has natural spectral tilt.
+    this.deEmphPrev = 0;
+
     this.displayCounter = 0;
 
     this.port.onmessage = (e) => {
@@ -1385,6 +1391,33 @@ class LPCVocoderWorklet extends AudioWorkletProcessor {
     return (x / 2147483648) - 1.0;
   }
 
+  // ── Liljencrants-Fant glottal pulse model ──
+  // The LF model shapes the glottal airflow to match real vocal fold motion:
+  // slow open phase → fast closure → brief return phase.
+  // This is what makes synthesized voice sound human rather than like a machine.
+  //
+  // Parameters (fixed at perceptually good defaults):
+  //   Tp = 0.4  (peak of opening phase, fraction of period)
+  //   Te = 0.76 (glottal closure, fraction of period)
+  //   Ta = 0.06 (return phase duration)
+  _glottalSample(ph) {
+    // ph is phase 0..1 over one pitch period
+    const Tp = 0.40, Te = 0.76, Ta = 0.06;
+    if (ph < Tp) {
+      // Rising phase: half-sine
+      return Math.sin(Math.PI * ph / Tp);
+    } else if (ph < Te) {
+      // Falling phase: exponential decay toward closure
+      // Scaled so it reaches 0 at Te
+      const t = (ph - Tp) / (Te - Tp);
+      return Math.cos(Math.PI * 0.5 * t);
+    } else {
+      // Return phase: brief negative lobe (glottal closure)
+      const t = (ph - Te) / Ta;
+      return -0.17 * Math.sin(Math.PI * t) * Math.exp(-t * 2);
+    }
+  }
+
   // ── Carrier synthesis — one sample ──
   _carrier(voiced) {
     let pitchMod = 1.0;
@@ -1397,32 +1430,36 @@ class LPCVocoderWorklet extends AudioWorkletProcessor {
 
     let out = 0;
     for (let v = 0; v < n; v++) {
-      // detune: spread ±detune/2 cents across voices
       const spreadCents = n === 1 ? 0 : ((v / (n - 1)) - 0.5) * this.detune;
       const detunedF = f * Math.pow(2, spreadCents / 1200);
       this.unisonPhases[v] = (this.unisonPhases[v] + detunedF / this.sr) % 1;
       const ph = this.unisonPhases[v];
 
       let s;
-      switch (this.waveType) {
-        case 'sawtooth': s = 2 * ph - 1; break;
-        case 'square':   s = ph < 0.5 ? 1 : -1; break;
-        case 'triangle': s = ph < 0.5 ? 4 * ph - 1 : 3 - 4 * ph; break;
-        default:         s = Math.sin(6.283185307 * ph); // sine
+      if (this.waveType === 'sine') {
+        s = Math.sin(6.283185307 * ph);
+      } else if (this.waveType === 'square') {
+        s = ph < 0.5 ? 1 : -1;
+      } else if (this.waveType === 'triangle') {
+        s = ph < 0.5 ? 4 * ph - 1 : 3 - 4 * ph;
+      } else {
+        // 'sawtooth' and default: use LF glottal pulse
+        // This is perceptually far closer to a real voice than a naive sawtooth
+        s = this._glottalSample(ph);
       }
       out += s;
     }
     out /= n;
 
-    // For unvoiced regions blend toward noise
-    if (voiced < 1) {
+    // For unvoiced regions blend toward noise (fricatives, stops)
+    if (voiced < 0.95) {
       const noise = this._noise();
-      out = out * voiced + noise * (1 - voiced);
+      out = out * Math.min(voiced, 1) + noise * (1 - Math.min(voiced, 1));
     }
 
-    // Additional noise mix (breath texture)
+    // Breath texture
     if (this.noiseOn && this.noiseLevel > 0) {
-      out += this._noise() * this.noiseLevel * 0.3;
+      out += this._noise() * this.noiseLevel * 0.25;
     }
 
     return out;
@@ -1491,7 +1528,14 @@ class LPCVocoderWorklet extends AudioWorkletProcessor {
       for (let j = this.order - 1; j > 0; j--) this.synthDelay[j] = this.synthDelay[j - 1];
       this.synthDelay[0] = y;
 
-      // Soft clip + volume — tanh keeps it from blowing up if LPC misbehaves
+      // De-emphasis: undo the pre-emphasis applied before LPC analysis.
+      // Pre-emphasis H(z) = 1 - 0.97z^-1 boosted highs for analysis.
+      // De-emphasis H(z) = 1/(1 - 0.97z^-1) restores natural spectral tilt.
+      // Without this the output sounds tinny/harsh.
+      y = y + this.preEmphAlpha * this.deEmphPrev;
+      this.deEmphPrev = y;
+
+      // Soft clip + volume
       output[i] = Math.tanh(y * this.vol);
     }
 
@@ -1675,21 +1719,49 @@ registerProcessor('lpc-vocoder', LPCVocoderWorklet);
       let rmsP = 0;
       for (let i = 0; i < pn; i++) rmsP += pbuf[i] * pbuf[i];
       rmsP = Math.sqrt(rmsP / pn);
-      if (rmsP > 0.01) {
+
+      if (rmsP > 0.008) {
+        // YIN-style normalized autocorrelation — more accurate than raw autocorr
+        // because it suppresses the DC bias that makes lag=0 always win
         const minLag = Math.floor(psr / 800), maxLag = Math.ceil(psr / 60);
         const norm0 = pbuf.reduce((s, v) => s + v * v, 0) || 1;
-        let bestLag = -1, bestCorr = -Infinity;
+
+        let bestLag = -1, bestVal = Infinity;
+        // Compute difference function d[tau] = sum(x[n] - x[n+tau])^2
+        // Normalized: d'[tau] = d[tau] / (mean of d[1..tau])
+        // Minimum of d'[tau] near 1 = best period candidate
+        let cumSum = 0;
         for (let lag = minLag; lag <= maxLag; lag++) {
-          let c = 0;
-          for (let i = 0; i < pn - lag; i++) c += pbuf[i] * pbuf[i + lag];
-          const nc = c / norm0;
-          if (nc > bestCorr) { bestCorr = nc; bestLag = lag; }
+          let d = 0;
+          for (let i = 0; i < pn - lag; i++) {
+            const diff = pbuf[i] - pbuf[i + lag];
+            d += diff * diff;
+          }
+          cumSum += d;
+          const dNorm = lag > 0 && cumSum > 0 ? d * lag / cumSum : 1;
+          if (dNorm < bestVal) { bestVal = dNorm; bestLag = lag; }
         }
-        this.detectedMidi = (bestLag > 0 && bestCorr > 0.15) ? fToM(psr / bestLag) : -1;
+
+        const rawMidi = (bestLag > 0 && bestVal < 0.25) ? fToM(psr / bestLag) : -1;
+
+        // Median filter over last 5 frames to kill octave jumps and jitter
+        if (!this._pitchHistory) this._pitchHistory = [];
+        this._pitchHistory.push(rawMidi);
+        if (this._pitchHistory.length > 5) this._pitchHistory.shift();
+
+        // Only use valid (non-silence) readings for median
+        const valid = this._pitchHistory.filter(v => v >= 0);
+        if (valid.length >= 2) {
+          const sorted = [...valid].sort((a, b) => a - b);
+          this.detectedMidi = sorted[Math.floor(sorted.length / 2)];
+        } else {
+          this.detectedMidi = rawMidi;
+        }
         this._pitchRms = rmsP;
       } else {
         this.detectedMidi = -1;
         this._pitchRms = 0;
+        if (this._pitchHistory) this._pitchHistory = [];
       }
     }
 
@@ -1925,7 +1997,7 @@ class MidiRecorder {
     if (!this.isRecording) return;
     const now = (performance.now() - this.startTime) / 1000;
     const midi = midiFloat >= 0 ? Math.round(midiFloat) : -1;
-    const vel  = Math.min(127, Math.max(1, Math.round(volume * 800)));
+    const vel  = Math.min(127, Math.max(1, Math.round(Math.sqrt(volume) * 180)));
     if (midi !== this.lastMidi) {
       if (this.lastMidi >= 0) this._noteOff(this.lastMidi, now);
       if (midi >= 0) { this._noteOn(midi, vel, now); this.lastOnTime = now; }
