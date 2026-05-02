@@ -1258,7 +1258,9 @@ class AudioEngine {
     for (let i = 1; i < totalSamples; i++)
       preEmph[i] = srcData[i] - PREEMPH_ALPHA * srcData[i - 1];
 
-    // ── Per-frame analysis: LPC + pitch + V/UV ──
+    // ── Per-frame analysis: LPC + V/UV ──
+    // Pitch is computed in a separate coarse pass below — not per-frame —
+    // to avoid O(n²×numFrames) blowing up the main thread.
     const analyzeFrame = (startSample) => {
       const p = LPC_ORDER_NEW;
 
@@ -1282,58 +1284,10 @@ class AudioEngine {
       const rms     = Math.sqrt(energy / frameSize);
       const zcrNorm = zcr / frameSize;
 
-      // ── Pitch detection via YIN on a longer window (40ms for accuracy) ──
-      // YIN uses the difference function to find the fundamental period.
-      // Running it on 40ms gives better frequency resolution for low voices.
-      const pitchWinSize = Math.round(sr * 0.040);
-      const maxLag = Math.round(sr / MIN_PITCH_HZ);
-      const minLag = Math.round(sr / MAX_PITCH_HZ);
-      let detectedPitch = 0, pitchConf = 0;
-
-      if (rms > 0.004 && zcrNorm < 0.25) {
-        // Build difference function d[tau]
-        const d = new Float32Array(maxLag + 1);
-        for (let tau = 1; tau <= maxLag; tau++) {
-          let sum = 0;
-          const lim = Math.min(pitchWinSize, totalSamples - startSample - tau);
-          for (let i = 0; i < lim; i++) {
-            const diff = srcData[startSample + i] - srcData[startSample + i + tau];
-            sum += diff * diff;
-          }
-          d[tau] = sum;
-        }
-        // Cumulative mean normalized difference function d'[tau]
-        const dn = new Float32Array(maxLag + 1);
-        dn[0] = 1;
-        let cumSum = 0;
-        for (let tau = 1; tau <= maxLag; tau++) {
-          cumSum += d[tau];
-          dn[tau] = cumSum > 0 ? d[tau] * tau / cumSum : 1;
-        }
-        // Find first dip below threshold 0.12 in range [minLag, maxLag]
-        let bestTau = -1, bestVal = 0.12;
-        for (let tau = minLag; tau <= maxLag; tau++) {
-          if (dn[tau] < bestVal) {
-            // Parabolic interpolation for sub-sample accuracy
-            const x0 = tau > 0     ? dn[tau-1] : dn[tau];
-            const x2 = tau < maxLag ? dn[tau+1] : dn[tau];
-            const correction = (x2 - x0) / (2 * (2*dn[tau] - x0 - x2) + 1e-10);
-            bestTau = tau + correction;
-            bestVal = dn[tau];
-          }
-        }
-        if (bestTau > 0) {
-          detectedPitch = sr / bestTau;
-          pitchConf     = 1 - bestVal; // higher = more confident
-        }
-      }
-
-      // Voiced/unvoiced: combine ZCR, energy, and pitch confidence
+      // V/UV from ZCR + energy only (pitch confidence added later in smoothing pass)
       let voiced = 0;
       if (rms > 0.003) {
-        const zcrScore   = zcrNorm < 0.12 ? 1 : zcrNorm > 0.28 ? 0 : (0.28 - zcrNorm) / 0.16;
-        const pitchScore = pitchConf > 0.5 ? 1 : pitchConf * 2;
-        voiced = Math.min(1, (zcrScore * 0.4 + pitchScore * 0.6));
+        voiced = zcrNorm < 0.12 ? 1 : zcrNorm > 0.28 ? 0 : (0.28 - zcrNorm) / 0.16;
       }
 
       // ── Levinson-Durbin LPC ──
@@ -1345,10 +1299,10 @@ class AudioEngine {
       }
 
       if (r[0] < 1e-12) {
-        return { coeffs: new Float32Array(p), gain: 0, voiced, rms, pitch: detectedPitch };
+        return { coeffs: new Float32Array(p), gain: 0, voiced, rms };
       }
 
-      // Bandwidth expansion gamma = 0.992 (slightly tighter than before — keeps formants crisp)
+      // Bandwidth expansion gamma = 0.992
       let g = 1.0;
       for (let k = 1; k <= p; k++) { g *= 0.992; r[k] *= g; }
       r[0] *= 1.0002;
@@ -1370,12 +1324,83 @@ class AudioEngine {
       const coeffs = new Float32Array(p);
       for (let i = 0; i < p; i++) coeffs[i] = -a[i + 1];
 
-      // Gain normalized to input RMS — output level tracks voice dynamics
       const predErr = Math.sqrt(Math.max(0, err));
       const gain    = rms > 0.001 ? rms / (predErr / Math.sqrt(r[0]) + 1e-9) * 0.5 : 0;
 
-      return { coeffs, gain, voiced, rms, pitch: detectedPitch };
+      return { coeffs, gain, voiced, rms };
     };
+
+    // ── Coarse pitch detection pass (separate, cheap) ──
+    // Run YIN every PITCH_STRIDE frames on a 20ms window.
+    // At 4ms hop, stride=4 = pitch updated every 16ms — plenty for speech.
+    // Total cost: numFrames/4 × 20ms_window × maxLag = manageable.
+    const PITCH_STRIDE  = 4;
+    const pitchWinSize  = frameSize; // reuse same 15ms window — no extra allocation
+    const maxLag        = Math.round(sr / MIN_PITCH_HZ);  // sr/60 ≈ 735
+    const minLag        = Math.round(sr / MAX_PITCH_HZ);  // sr/500 ≈ 88
+    const coarsePitch   = new Float32Array(numFrames);     // filled sparsely, then interpolated
+
+    for (let f = 0; f < numFrames; f += PITCH_STRIDE) {
+      const startSample = f * hopSize;
+      // Quick energy check — skip silent frames entirely
+      let energy = 0;
+      for (let i = 0; i < pitchWinSize && startSample + i < totalSamples; i++)
+        energy += srcData[startSample + i] ** 2;
+      const rms = Math.sqrt(energy / pitchWinSize);
+      if (rms < 0.004) { coarsePitch[f] = 0; continue; }
+
+      // YIN difference function — O(pitchWinSize × maxLag) per stride-frame
+      const d  = new Float32Array(maxLag + 1);
+      const lim = Math.min(pitchWinSize, totalSamples - startSample - maxLag);
+      if (lim < minLag) { coarsePitch[f] = 0; continue; }
+
+      for (let tau = minLag; tau <= maxLag; tau++) {
+        let sum = 0;
+        for (let i = 0; i < lim; i++) {
+          const diff = srcData[startSample + i] - srcData[startSample + i + tau];
+          sum += diff * diff;
+        }
+        d[tau] = sum;
+      }
+
+      // Cumulative mean normalized difference
+      const dn = new Float32Array(maxLag + 1);
+      dn[0] = 1;
+      let cumSum = 0;
+      for (let tau = 1; tau <= maxLag; tau++) {
+        cumSum += d[tau] || 0;
+        dn[tau] = tau >= minLag && cumSum > 0 ? d[tau] * tau / cumSum : 1;
+      }
+
+      // Find first dip below 0.15
+      let bestTau = -1, bestVal = 0.15;
+      for (let tau = minLag; tau <= maxLag; tau++) {
+        if (dn[tau] < bestVal) {
+          const x0 = dn[tau - 1] ?? dn[tau];
+          const x2 = tau < maxLag ? dn[tau + 1] : dn[tau];
+          const denom = 2 * (2 * dn[tau] - x0 - x2);
+          const correction = Math.abs(denom) > 1e-8 ? (x2 - x0) / denom : 0;
+          bestTau = tau + correction;
+          bestVal = dn[tau];
+          break; // take first dip, not deepest — avoids octave errors
+        }
+      }
+      coarsePitch[f] = bestTau > 0 ? sr / bestTau : 0;
+    }
+
+    // Fill gaps between stride frames by linear interpolation
+    const pitchPerFrame = new Float32Array(numFrames);
+    for (let f = 0; f < numFrames; f++) {
+      if (f % PITCH_STRIDE === 0) {
+        pitchPerFrame[f] = coarsePitch[f];
+      } else {
+        const prev = Math.floor(f / PITCH_STRIDE) * PITCH_STRIDE;
+        const next = Math.min(prev + PITCH_STRIDE, numFrames - 1);
+        const t    = (f - prev) / PITCH_STRIDE;
+        const p0   = coarsePitch[prev], p1 = coarsePitch[next];
+        pitchPerFrame[f] = p0 > 0 && p1 > 0 ? p0 + (p1 - p0) * t : (p0 || p1);
+      }
+    }
 
     const statusPill = document.getElementById('statusPill');
     if (statusPill) { statusPill.textContent = 'ANALYZING…'; statusPill.className = 'pill pill-armed'; }
@@ -1383,14 +1408,14 @@ class AudioEngine {
     const frameCoeffs = new Array(numFrames);
     const frameGains  = new Float32Array(numFrames);
     const frameVoiced = new Float32Array(numFrames);
-    const framePitch  = new Float32Array(numFrames);  // per-frame detected pitch (Hz), 0 = unvoiced
+    const framePitch  = new Float32Array(numFrames);
 
     for (let f = 0; f < numFrames; f++) {
       const res = analyzeFrame(f * hopSize);
       frameCoeffs[f]  = res.coeffs;
       frameGains[f]   = res.gain;
       frameVoiced[f]  = res.voiced;
-      framePitch[f]   = res.pitch;
+      framePitch[f]   = pitchPerFrame[f]; // from coarse pitch pass above
     }
 
     // ── Pitch smoothing pass ──
