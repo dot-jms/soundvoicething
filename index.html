@@ -1219,13 +1219,12 @@ class AudioEngine {
     //
     // All of this runs per-sample in the worklet. No rAF timing issues.
 
-    const NUM_BANDS     = 40;    // 40 bands: enough resolution without thinning
-    const FREQ_LOW      = 80;    // Hz
-    const FREQ_HIGH     = 8000;  // Hz
-    const ATK_MS        = 4;     // envelope attack  — fast enough for plosives
-    const REL_MS        = 50;    // envelope release — smooth enough for vowels
+    const NUM_BANDS     = 32;
+    const FREQ_LOW      = 100;
+    const FREQ_HIGH     = 7000;
+    const ATK_MS        = 2;     // very fast attack — catches note onsets
+    const REL_MS        = 20;    // 20ms release — notes don't smear
 
-    // Log-spaced band center frequencies
     const bandFreqs = Array.from({ length: NUM_BANDS }, (_, i) =>
       FREQ_LOW * Math.pow(FREQ_HIGH / FREQ_LOW, i / (NUM_BANDS - 1))
     );
@@ -1239,7 +1238,6 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
     this.sr  = sr;
     this.n   = ${NUM_BANDS};
 
-    // Carrier params
     this.pitch        = p.pitch;
     this.waveType     = p.waveType;
     this.unison       = Math.max(1, p.unison);
@@ -1252,27 +1250,21 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
     this.vol          = p.vol;
     this.vibratoPhase = 0;
 
-    // Unison oscillator phases — staggered
     this.unisonPhases = new Float32Array(this.unison);
     for (let i = 0; i < this.unison; i++) this.unisonPhases[i] = i / this.unison;
 
     const freqs = ${JSON.stringify(Array.from(bandFreqs))};
 
-    // Per-band biquad bandpass filters for modulator and carrier
-    // Using second-order sections (direct form II transposed) for stability
-    this.modFilters = freqs.map(f => this._makeBP(f, sr));
-    this.carFilters = freqs.map(f => this._makeBP(f, sr));
+    // Q=5: bands are distinct enough to resolve musical notes but wide enough
+    // to overlap smoothly. Q=2.5 was so wide everything blurred together.
+    this.modFilters = freqs.map(f => this._makeBP(f, 5.0, sr));
+    this.carFilters = freqs.map(f => this._makeBP(f, 5.0, sr));
 
-    // Per-band envelope state
-    const atkCoeff = 1 - Math.exp(-1 / (sr * ${ATK_MS / 1000}));
-    const relCoeff = 1 - Math.exp(-1 / (sr * ${REL_MS / 1000}));
-    this.atkCoeff = atkCoeff;
-    this.relCoeff = relCoeff;
-    this.envState = new Float32Array(this.n);
+    this.atkCoeff  = 1 - Math.exp(-1 / (sr * ${ATK_MS / 1000}));
+    this.relCoeff  = 1 - Math.exp(-1 / (sr * ${REL_MS / 1000}));
+    this.envState  = new Float32Array(this.n);
 
-    // Noise state for xorshift
     this.ns = (Math.random() * 0xffffffff) >>> 0;
-
     this.displayCounter = 0;
 
     this.port.onmessage = (e) => {
@@ -1294,27 +1286,27 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
     };
   }
 
-  // Biquad bandpass — direct form II transposed, Q=2.5 for nice overlap
-  _makeBP(freq, sr) {
-    const Q  = 2.5;
-    const w0 = 2 * Math.PI * freq / sr;
+  _makeBP(freq, Q, sr) {
+    const w0    = 2 * Math.PI * freq / sr;
     const alpha = Math.sin(w0) / (2 * Q);
     const cosw  = Math.cos(w0);
     const a0    = 1 + alpha;
+    // Store as direct form I coefficients — simpler state, no sign errors
     return {
       b0:  alpha / a0,
+      b1:  0,
       b2: -alpha / a0,
       a1: -2 * cosw / a0,
       a2: (1 - alpha) / a0,
-      s1: 0, s2: 0  // state
+      x1: 0, x2: 0, y1: 0, y2: 0
     };
   }
 
+  // Direct form I — straightforward and numerically reliable
   _bpSample(f, x) {
-    // Direct form II transposed — numerically stable
-    const y = f.b0 * x + f.s1;
-    f.s1 = -f.b0 * x - f.a1 * y + f.s2;
-    f.s2 = f.b2 * x - f.a2 * y;
+    const y = f.b0*x + f.b1*f.x1 + f.b2*f.x2 - f.a1*f.y1 - f.a2*f.y2;
+    f.x2 = f.x1; f.x1 = x;
+    f.y2 = f.y1; f.y1 = y;
     return y;
   }
 
@@ -1325,15 +1317,16 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
     return (x / 2147483648) - 1.0;
   }
 
-  // LF glottal pulse — makes synth voice sound like a voice, not a buzz saw
   _glottal(ph) {
     if (ph < 0.40) return Math.sin(3.14159265 * ph / 0.40);
     if (ph < 0.76) return Math.cos(1.5707963 * (ph - 0.40) / 0.36);
-    if (ph < 0.82) { const t = (ph - 0.76) / 0.06; return -0.17 * Math.sin(3.14159265 * t) * Math.exp(-t * 2); }
+    if (ph < 0.82) { const t = (ph-0.76)/0.06; return -0.17*Math.sin(3.14159265*t)*Math.exp(-t*2); }
     return 0;
   }
 
-  // One sample of carrier — sum of unison voices
+  // Carrier: pitched oscillator PLUS broadband buzz so every band has energy.
+  // A pure sine at 200Hz has no energy in the 2kHz band — the carrier needs
+  // harmonics reaching up to the highest band for the vocoder to work.
   _carrier() {
     let pitchMod = 1.0;
     if (this.vibratoOn) {
@@ -1344,7 +1337,7 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
     const n = this.unison;
     let out = 0;
     for (let v = 0; v < n; v++) {
-      const sc = n === 1 ? 0 : ((v / (n - 1)) - 0.5) * this.detune;
+      const sc = n === 1 ? 0 : ((v / (n-1)) - 0.5) * this.detune;
       const df = f * Math.pow(2, sc / 1200);
       this.unisonPhases[v] = (this.unisonPhases[v] + df / this.sr) % 1;
       const ph = this.unisonPhases[v];
@@ -1356,13 +1349,16 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
       out += s;
     }
     out /= n;
+    // Always mix in a small amount of broadband noise so high-frequency bands
+    // have carrier energy to shape. Without this, bands above ~2kHz are dead.
+    out = out * 0.85 + this._noise() * 0.15;
     if (this.noiseOn && this.noiseLevel > 0)
       out += this._noise() * this.noiseLevel * 0.2;
     return out;
   }
 
   process(inputs, outputs) {
-    const mod    = inputs[0]?.[0];   // modulator: the uploaded audio
+    const mod    = inputs[0]?.[0];
     const output = outputs[0]?.[0];
     if (!output) return true;
     if (!mod || mod.length === 0) { output.fill(0); return true; }
@@ -1373,29 +1369,24 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
     const n   = this.n;
 
     for (let i = 0; i < bs; i++) {
-      const m = mod[i];           // modulator sample
-      const c = this._carrier();  // carrier sample
+      const m = mod[i];
+      const c = this._carrier();
 
       let out = 0;
       for (let b = 0; b < n; b++) {
-        // Bandpass the modulator to get band energy
+        // Bandpass modulator → rectify → envelope follow
         const mBand = this._bpSample(this.modFilters[b], m);
-
-        // Full-wave rectify → envelope follow
-        const rect = Math.abs(mBand);
-        const env  = this.envState[b];
+        const rect  = Math.abs(mBand);
+        const env   = this.envState[b];
         this.envState[b] = env + (rect > env ? atk : rel) * (rect - env);
 
-        // Bandpass the carrier, apply envelope as gain
-        const cBand = this._bpSample(this.carFilters[b], c);
-        out += cBand * this.envState[b];
+        // Bandpass carrier → scale by envelope
+        out += this._bpSample(this.carFilters[b], c) * this.envState[b];
       }
 
-      // Scale: compensate for band overlap summation
-      output[i] = Math.tanh(out * this.vol * (2.5 / n));
+      output[i] = Math.tanh(out * this.vol * (4.0 / Math.sqrt(n)));
     }
 
-    // Send RMS for VU display
     this.displayCounter += bs;
     if (this.displayCounter >= 512) {
       this.displayCounter = 0;
@@ -1403,7 +1394,6 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
       for (let i = 0; i < bs; i++) rms += output[i] * output[i];
       this.port.postMessage({ rms: Math.sqrt(rms / bs) });
     }
-
     return true;
   }
 }
