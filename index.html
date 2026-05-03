@@ -1203,300 +1203,44 @@ class AudioEngine {
     const { pitch, vol, unison, detune, waveType, vibratoOn, vibratoRate, vibratoDepth,
             noiseOn, noiseLevel, reverbOn, reverbMix } = this.params;
 
-    this._envState.fill(0);
     this.bandBank = [];
     this.carrierOscillators = [];
     this.nodes = {};
 
-    // ── LPC Vocoder AudioWorklet ──
-    // LPC (Linear Predictive Coding) directly models the vocal tract as an
-    // all-pole filter, then re-excites it with a synthetic carrier.
-    // This is how real intelligible vocoders work — phones, codecs, Speak & Spell.
-    // The worklet does everything in the audio thread:
-    //   1. Buffer incoming voice frames
-    //   2. Run Levinson-Durbin LPC analysis every 10ms
-    //   3. Generate carrier (pitched saw + noise for unvoiced)
-    //   4. Filter carrier through LPC synthesis filter
-    //   5. Output synthesized speech
+    // ── Channel Vocoder AudioWorklet ──
+    // Everything runs in the audio thread at sample rate.
+    // The modulator (input audio) drives per-band envelope followers.
+    // Those envelopes control gain of the carrier in each band.
+    // Works for voice, music, anything — no vocal tract assumptions.
+    //
+    // Architecture:
+    //   modulator → N bandpass filters → rectify → lowpass (envelope) → VCA
+    //   carrier   → N bandpass filters ──────────────────────────────→ VCA → sum → out
+    //
+    // All of this runs per-sample in the worklet. No rAF timing issues.
 
-    const LPC_ORDER = 20; // kept for lpcParams reference — matches LPC_ORDER_NEW below
-    const lpcParams = {
-      pitch:       mToF(pitch),
-      waveType:    waveType,
-      unison:      unison,
-      detune:      detune,
-      noiseOn:     noiseOn,
-      noiseLevel:  noiseLevel,
-      vibratoOn:   vibratoOn,
-      vibratoRate: vibratoRate,
-      vibratoDepth: vibratoDepth,
-      vol:         dbToGain(vol),
-    };
+    const NUM_BANDS     = 40;    // 40 bands: enough resolution without thinning
+    const FREQ_LOW      = 80;    // Hz
+    const FREQ_HIGH     = 8000;  // Hz
+    const ATK_MS        = 4;     // envelope attack  — fast enough for plosives
+    const REL_MS        = 50;    // envelope release — smooth enough for vowels
 
-    // ── Offline pre-analysis ──
-    // We have the full buffer — analyze everything upfront at maximum quality.
-    // Shorter frames (15ms) for temporal resolution, higher order (20) for spectral detail,
-    // tighter hop (4ms) for smooth transitions, plus per-frame pitch tracking.
-    const LPC_ORDER_NEW  = 20;
-    const LPC_FRAME_MS   = 30;    // 30ms — fits one full period of 33Hz voice, prevents instability
-    const LPC_HOP_MS     = 5;     // 5ms hop — still 200 frames/sec, fine-grained enough
-    const PREEMPH_ALPHA  = 0.97;
-    const MIN_PITCH_HZ   = 60;
-    const MAX_PITCH_HZ   = 500;
-
-    const sr           = this.ctx.sampleRate;
-    const frameSize    = Math.round(sr * LPC_FRAME_MS / 1000);
-    const hopSize      = Math.round(sr * LPC_HOP_MS   / 1000);
-    const audioBuf     = this.audioBuffer;
-    const srcData      = audioBuf.getChannelData(0);
-    const totalSamples = srcData.length;
-    const numFrames    = Math.floor((totalSamples - frameSize) / hopSize) + 1;
-
-    // Pre-emphasis on the whole signal
-    const preEmph = new Float32Array(totalSamples);
-    preEmph[0] = srcData[0];
-    for (let i = 1; i < totalSamples; i++)
-      preEmph[i] = srcData[i] - PREEMPH_ALPHA * srcData[i - 1];
-
-    // ── Per-frame analysis: LPC + V/UV ──
-    // Pitch is computed in a separate coarse pass below — not per-frame —
-    // to avoid O(n²×numFrames) blowing up the main thread.
-    const analyzeFrame = (startSample) => {
-      const p = LPC_ORDER_NEW;
-
-      // Hann-windowed pre-emphasized frame for LPC
-      const w = new Float32Array(frameSize);
-      for (let i = 0; i < frameSize; i++) {
-        const idx = startSample + i;
-        const s = idx < totalSamples ? preEmph[idx] : 0;
-        w[i] = s * (0.5 - 0.5 * Math.cos(6.283185307 * i / (frameSize - 1)));
-      }
-
-      // Energy + ZCR on original signal for V/UV
-      let energy = 0, zcr = 0;
-      for (let i = 0; i < frameSize; i++) {
-        const idx = startSample + i;
-        const s    = idx < totalSamples ? srcData[idx] : 0;
-        const prev = idx > 0 ? srcData[idx - 1] : 0;
-        energy += s * s;
-        if (i > 0 && (s >= 0) !== (prev >= 0)) zcr++;
-      }
-      const rms     = Math.sqrt(energy / frameSize);
-      const zcrNorm = zcr / frameSize;
-
-      // V/UV from ZCR + energy only (pitch confidence added later in smoothing pass)
-      let voiced = 0;
-      if (rms > 0.003) {
-        voiced = zcrNorm < 0.12 ? 1 : zcrNorm > 0.28 ? 0 : (0.28 - zcrNorm) / 0.16;
-      }
-
-      // ── Levinson-Durbin LPC ──
-      const r = new Float32Array(p + 1);
-      for (let lag = 0; lag <= p; lag++) {
-        let s = 0;
-        for (let i = 0; i < frameSize - lag; i++) s += w[i] * w[i + lag];
-        r[lag] = s;
-      }
-
-      if (r[0] < 1e-12) {
-        return { coeffs: new Float32Array(p), gain: 0, voiced, rms };
-      }
-
-      // Bandwidth expansion gamma = 0.98 — tighter for longer frames, keeps all poles
-      // well inside the unit circle even for low-pitched voices
-      let g = 1.0;
-      for (let k = 1; k <= p; k++) { g *= 0.98; r[k] *= g; }
-      r[0] *= 1.001;
-
-      const a   = new Float32Array(p + 1);
-      const tmp = new Float32Array(p + 1);
-      let err = r[0];
-      for (let m = 1; m <= p; m++) {
-        let num = r[m];
-        for (let j = 1; j < m; j++) num += a[j] * r[m - j];
-        const k = Math.max(-0.9999, Math.min(0.9999, -num / err));
-        for (let j = 1; j < m; j++) tmp[j] = a[j];
-        for (let j = 1; j < m; j++) a[j] = tmp[j] + k * tmp[m - j];
-        a[m] = k;
-        err  *= (1 - k * k);
-        if (err < 1e-20) break;
-      }
-
-      const coeffs = new Float32Array(p);
-      for (let i = 0; i < p; i++) coeffs[i] = -a[i + 1];
-
-      const predErr = Math.sqrt(Math.max(0, err));
-      const gain    = rms > 0.001 ? rms / (predErr / Math.sqrt(r[0]) + 1e-9) * 0.5 : 0;
-
-      return { coeffs, gain, voiced, rms };
-    };
-
-    // ── Coarse pitch detection pass (separate, cheap) ──
-    // Run YIN every PITCH_STRIDE frames on a 20ms window.
-    // At 4ms hop, stride=4 = pitch updated every 16ms — plenty for speech.
-    // Total cost: numFrames/4 × 20ms_window × maxLag = manageable.
-    const PITCH_STRIDE  = 4;
-    const pitchWinSize  = frameSize; // reuse same 15ms window — no extra allocation
-    const maxLag        = Math.round(sr / MIN_PITCH_HZ);  // sr/60 ≈ 735
-    const minLag        = Math.round(sr / MAX_PITCH_HZ);  // sr/500 ≈ 88
-    const coarsePitch   = new Float32Array(numFrames);     // filled sparsely, then interpolated
-
-    for (let f = 0; f < numFrames; f += PITCH_STRIDE) {
-      const startSample = f * hopSize;
-      // Quick energy check — skip silent frames entirely
-      let energy = 0;
-      for (let i = 0; i < pitchWinSize && startSample + i < totalSamples; i++)
-        energy += srcData[startSample + i] ** 2;
-      const rms = Math.sqrt(energy / pitchWinSize);
-      if (rms < 0.004) { coarsePitch[f] = 0; continue; }
-
-      // YIN difference function — O(pitchWinSize × maxLag) per stride-frame
-      const d  = new Float32Array(maxLag + 1);
-      const lim = Math.min(pitchWinSize, totalSamples - startSample - maxLag);
-      if (lim < minLag) { coarsePitch[f] = 0; continue; }
-
-      for (let tau = minLag; tau <= maxLag; tau++) {
-        let sum = 0;
-        for (let i = 0; i < lim; i++) {
-          const diff = srcData[startSample + i] - srcData[startSample + i + tau];
-          sum += diff * diff;
-        }
-        d[tau] = sum;
-      }
-
-      // Cumulative mean normalized difference
-      const dn = new Float32Array(maxLag + 1);
-      dn[0] = 1;
-      let cumSum = 0;
-      for (let tau = 1; tau <= maxLag; tau++) {
-        cumSum += d[tau] || 0;
-        dn[tau] = tau >= minLag && cumSum > 0 ? d[tau] * tau / cumSum : 1;
-      }
-
-      // Find first dip below 0.15
-      let bestTau = -1, bestVal = 0.15;
-      for (let tau = minLag; tau <= maxLag; tau++) {
-        if (dn[tau] < bestVal) {
-          const x0 = dn[tau - 1] ?? dn[tau];
-          const x2 = tau < maxLag ? dn[tau + 1] : dn[tau];
-          const denom = 2 * (2 * dn[tau] - x0 - x2);
-          const correction = Math.abs(denom) > 1e-8 ? (x2 - x0) / denom : 0;
-          bestTau = tau + correction;
-          bestVal = dn[tau];
-          break; // take first dip, not deepest — avoids octave errors
-        }
-      }
-      coarsePitch[f] = bestTau > 0 ? sr / bestTau : 0;
-    }
-
-    // Fill gaps between stride frames by linear interpolation
-    const pitchPerFrame = new Float32Array(numFrames);
-    for (let f = 0; f < numFrames; f++) {
-      if (f % PITCH_STRIDE === 0) {
-        pitchPerFrame[f] = coarsePitch[f];
-      } else {
-        const prev = Math.floor(f / PITCH_STRIDE) * PITCH_STRIDE;
-        const next = Math.min(prev + PITCH_STRIDE, numFrames - 1);
-        const t    = (f - prev) / PITCH_STRIDE;
-        const p0   = coarsePitch[prev], p1 = coarsePitch[next];
-        pitchPerFrame[f] = p0 > 0 && p1 > 0 ? p0 + (p1 - p0) * t : (p0 || p1);
-      }
-    }
-
-    const statusPill = document.getElementById('statusPill');
-    if (statusPill) { statusPill.textContent = 'ANALYZING…'; statusPill.className = 'pill pill-armed'; }
-
-    const frameCoeffs = new Array(numFrames);
-    const frameGains  = new Float32Array(numFrames);
-    const frameVoiced = new Float32Array(numFrames);
-    const framePitch  = new Float32Array(numFrames);
-    const frameRms    = new Float32Array(numFrames); // for velocity normalization
-
-    for (let f = 0; f < numFrames; f++) {
-      const res = analyzeFrame(f * hopSize);
-      frameCoeffs[f]  = res.coeffs;
-      frameGains[f]   = res.gain;
-      frameVoiced[f]  = res.voiced;
-      framePitch[f]   = pitchPerFrame[f];
-      frameRms[f]     = res.rms;
-    }
-
-    // Peak RMS across whole recording — used to normalize velocity to full 1-127 range
-    const peakRms = Math.max(...frameRms) || 0.1;
-
-    // ── Pitch smoothing pass ──
-    // Median-filter the pitch track over ±3 frames to remove octave jumps,
-    // then low-pass smooth it so pitch glides rather than stepping.
-    const smoothedPitch = new Float32Array(numFrames);
-    for (let f = 0; f < numFrames; f++) {
-      // Collect voiced-only pitches in window
-      const win = [];
-      for (let k = Math.max(0, f-3); k <= Math.min(numFrames-1, f+3); k++) {
-        if (framePitch[k] > 0) win.push(framePitch[k]);
-      }
-      if (win.length > 0) {
-        win.sort((a, b) => a - b);
-        smoothedPitch[f] = win[Math.floor(win.length / 2)];
-      }
-    }
-    // Low-pass smooth: exponential moving average forward and backward
-    let prev = 0;
-    for (let f = 0; f < numFrames; f++) {
-      if (smoothedPitch[f] > 0) {
-        prev = prev === 0 ? smoothedPitch[f] : prev * 0.7 + smoothedPitch[f] * 0.3;
-        smoothedPitch[f] = prev;
-      } else {
-        smoothedPitch[f] = prev; // hold last voiced pitch through unvoiced regions
-      }
-    }
-
-    if (statusPill) { statusPill.textContent = 'READY'; statusPill.className = 'pill pill-ready'; }
-
-    // Flatten for transfer
-    const flatCoeffs = new Float32Array(numFrames * LPC_ORDER_NEW);
-    for (let f = 0; f < numFrames; f++)
-      flatCoeffs.set(frameCoeffs[f], f * LPC_ORDER_NEW);
+    // Log-spaced band center frequencies
+    const bandFreqs = Array.from({ length: NUM_BANDS }, (_, i) =>
+      FREQ_LOW * Math.pow(FREQ_HIGH / FREQ_LOW, i / (NUM_BANDS - 1))
+    );
 
     const workletCode = `
-class LPCVocoderWorklet extends AudioWorkletProcessor {
+class ChannelVocoderWorklet extends AudioWorkletProcessor {
   constructor(options) {
     super();
-    const p       = options.processorOptions;
-    this.sr       = sampleRate;
-    this.order    = ${LPC_ORDER_NEW};
-    this.hopSize  = ${hopSize};
+    const p  = options.processorOptions;
+    const sr = sampleRate;
+    this.sr  = sr;
+    this.n   = ${NUM_BANDS};
 
-    // Frame tables — arrive via port
-    this.frameCoeffs   = null;
-    this.frameGains    = null;
-    this.frameVoiced   = null;
-    this.framePitch    = null;  // per-frame detected pitch (Hz)
-    this.numFrames     = p.numFrames;
-    this.totalSamples  = p.totalSamples;
-    this.ready         = false;
-
-    this.samplePos     = 0;
-    this.synthDelay    = new Float32Array(this.order);
-    this.deEmphPrev    = 0;
-    this.deEmphAlpha   = ${PREEMPH_ALPHA};
-
-    // Per-sample interpolated state (updated at block boundaries)
-    this.curCoeffs  = new Float32Array(this.order);
-    this.curGain    = 0;
-    this.curVoiced  = 0;
-    this.curPitch   = p.pitch; // Hz — starts at user-set pitch, transitions to tracked
-
-    // Per-sample deltas (avoids per-sample division/multiply in inner loop)
-    this.dCoeffs  = new Float32Array(this.order);
-    this.dGain    = 0;
-    this.dVoiced  = 0;
-    this.dPitch   = 0;
-    this.stepPos  = 0; // samples since last frame update
-    this.lastFrameIdx = -1;
-
-    // User params
-    this.userPitch    = p.pitch;   // Hz — used when no pitch detected
-    this.pitchScale   = 1.0;       // multiplier so user can transpose
+    // Carrier params
+    this.pitch        = p.pitch;
     this.waveType     = p.waveType;
     this.unison       = Math.max(1, p.unison);
     this.detune       = p.detune;
@@ -1508,28 +1252,33 @@ class LPCVocoderWorklet extends AudioWorkletProcessor {
     this.vol          = p.vol;
     this.vibratoPhase = 0;
 
+    // Unison oscillator phases — staggered
     this.unisonPhases = new Float32Array(this.unison);
     for (let i = 0; i < this.unison; i++) this.unisonPhases[i] = i / this.unison;
 
+    const freqs = ${JSON.stringify(Array.from(bandFreqs))};
+
+    // Per-band biquad bandpass filters for modulator and carrier
+    // Using second-order sections (direct form II transposed) for stability
+    this.modFilters = freqs.map(f => this._makeBP(f, sr));
+    this.carFilters = freqs.map(f => this._makeBP(f, sr));
+
+    // Per-band envelope state
+    const atkCoeff = 1 - Math.exp(-1 / (sr * ${ATK_MS / 1000}));
+    const relCoeff = 1 - Math.exp(-1 / (sr * ${REL_MS / 1000}));
+    this.atkCoeff = atkCoeff;
+    this.relCoeff = relCoeff;
+    this.envState = new Float32Array(this.n);
+
+    // Noise state for xorshift
     this.ns = (Math.random() * 0xffffffff) >>> 0;
+
     this.displayCounter = 0;
 
     this.port.onmessage = (e) => {
       if (!e.data) return;
       const d = e.data;
-      if (d.init) {
-        this.frameCoeffs = d.flatCoeffs;
-        this.frameGains  = d.frameGains;
-        this.frameVoiced = d.frameVoiced;
-        this.framePitch  = d.framePitch;
-        // Initialize curPitch from first voiced frame
-        for (let f = 0; f < this.numFrames; f++) {
-          if (this.framePitch[f] > 0) { this.curPitch = this.framePitch[f]; break; }
-        }
-        this.ready = true;
-        return;
-      }
-      if (d.pitch        !== undefined) this.userPitch    = d.pitch;
+      if (d.pitch        !== undefined) this.pitch        = d.pitch;
       if (d.waveType     !== undefined) this.waveType     = d.waveType;
       if (d.detune       !== undefined) this.detune       = d.detune;
       if (d.noiseOn      !== undefined) this.noiseOn      = d.noiseOn;
@@ -1545,6 +1294,30 @@ class LPCVocoderWorklet extends AudioWorkletProcessor {
     };
   }
 
+  // Biquad bandpass — direct form II transposed, Q=2.5 for nice overlap
+  _makeBP(freq, sr) {
+    const Q  = 2.5;
+    const w0 = 2 * Math.PI * freq / sr;
+    const alpha = Math.sin(w0) / (2 * Q);
+    const cosw  = Math.cos(w0);
+    const a0    = 1 + alpha;
+    return {
+      b0:  alpha / a0,
+      b2: -alpha / a0,
+      a1: -2 * cosw / a0,
+      a2: (1 - alpha) / a0,
+      s1: 0, s2: 0  // state
+    };
+  }
+
+  _bpSample(f, x) {
+    // Direct form II transposed — numerically stable
+    const y = f.b0 * x + f.s1;
+    f.s1 = -f.b0 * x - f.a1 * y + f.s2;
+    f.s2 = f.b2 * x - f.a2 * y;
+    return y;
+  }
+
   _noise() {
     let x = this.ns;
     x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
@@ -1552,138 +1325,89 @@ class LPCVocoderWorklet extends AudioWorkletProcessor {
     return (x / 2147483648) - 1.0;
   }
 
-  // LF glottal pulse — asymmetric, matches real vocal fold motion
-  _glottalSample(ph) {
+  // LF glottal pulse — makes synth voice sound like a voice, not a buzz saw
+  _glottal(ph) {
     if (ph < 0.40) return Math.sin(3.14159265 * ph / 0.40);
-    if (ph < 0.76) { const t = (ph-0.40)/0.36; return Math.cos(1.5707963 * t); }
-    if (ph < 0.82) { const t = (ph-0.76)/0.06; return -0.17*Math.sin(3.14159265*t)*Math.exp(-t*2); }
+    if (ph < 0.76) return Math.cos(1.5707963 * (ph - 0.40) / 0.36);
+    if (ph < 0.82) { const t = (ph - 0.76) / 0.06; return -0.17 * Math.sin(3.14159265 * t) * Math.exp(-t * 2); }
     return 0;
   }
 
-  _carrier(voiced, pitch) {
-    // Vibrato modulates the DETECTED pitch (so it sounds musical, not robotic)
+  // One sample of carrier — sum of unison voices
+  _carrier() {
     let pitchMod = 1.0;
     if (this.vibratoOn) {
       this.vibratoPhase = (this.vibratoPhase + this.vibratoRate / this.sr) % 1;
       pitchMod = Math.pow(2, Math.sin(6.283185307 * this.vibratoPhase) * this.vibratoDepth / 1200);
     }
-
-    // Pitch tracking: use the detected voice pitch directly as the carrier frequency.
-    // The user pitch knob transposes up/down from the original — it's a semitone offset,
-    // not an absolute pitch. This means the carrier follows your voice's actual inflection.
-    // userPitch is in Hz (from mToF(midi)), default C3 = 130.81Hz = 0 semitones offset.
-    const transposeRatio = pitch > 0 ? this.userPitch / 130.81 : 1.0;
-    const trackPitch = pitch > 0 ? pitch * transposeRatio : this.userPitch;
-    const f = trackPitch * pitchMod;
-
+    const f = this.pitch * pitchMod;
     const n = this.unison;
     let out = 0;
     for (let v = 0; v < n; v++) {
-      const spreadCents = n === 1 ? 0 : ((v / (n - 1)) - 0.5) * this.detune;
-      const df = f * Math.pow(2, spreadCents / 1200);
+      const sc = n === 1 ? 0 : ((v / (n - 1)) - 0.5) * this.detune;
+      const df = f * Math.pow(2, sc / 1200);
       this.unisonPhases[v] = (this.unisonPhases[v] + df / this.sr) % 1;
       const ph = this.unisonPhases[v];
       let s;
       if      (this.waveType === 'sine')     s = Math.sin(6.283185307 * ph);
       else if (this.waveType === 'square')   s = ph < 0.5 ? 1 : -1;
       else if (this.waveType === 'triangle') s = ph < 0.5 ? 4*ph-1 : 3-4*ph;
-      else                                   s = this._glottalSample(ph);
+      else                                   s = this._glottal(ph);
       out += s;
     }
     out /= n;
-
-    // Smooth voiced/unvoiced blend — avoids hard clicks at V/UV boundaries
-    if (voiced < 0.95) out = out * voiced + this._noise() * (1 - voiced);
-    if (this.noiseOn && this.noiseLevel > 0) out += this._noise() * this.noiseLevel * 0.15;
+    if (this.noiseOn && this.noiseLevel > 0)
+      out += this._noise() * this.noiseLevel * 0.2;
     return out;
   }
 
   process(inputs, outputs) {
+    const mod    = inputs[0]?.[0];   // modulator: the uploaded audio
     const output = outputs[0]?.[0];
     if (!output) return true;
-    if (!this.ready) { output.fill(0); return true; }
+    if (!mod || mod.length === 0) { output.fill(0); return true; }
 
-    const bs    = output.length;
-    const order = this.order;
-    const hop   = this.hopSize;
+    const bs  = output.length;
+    const atk = this.atkCoeff;
+    const rel = this.relCoeff;
+    const n   = this.n;
 
     for (let i = 0; i < bs; i++) {
-      // Compute current frame index and fractional position
-      const frameIdx = Math.min(Math.floor(this.samplePos / hop), this.numFrames - 1);
+      const m = mod[i];           // modulator sample
+      const c = this._carrier();  // carrier sample
 
-      // When we cross into a new frame, recompute per-sample deltas
-      // This replaces per-sample lerp math with simple additions
-      if (frameIdx !== this.lastFrameIdx) {
-        this.lastFrameIdx = frameIdx;
-        this.stepPos = this.samplePos - frameIdx * hop;
-        const nextIdx  = Math.min(frameIdx + 1, this.numFrames - 1);
-        const base     = frameIdx * order;
-        const nextBase = nextIdx  * order;
-        const invHop   = 1.0 / hop;
+      let out = 0;
+      for (let b = 0; b < n; b++) {
+        // Bandpass the modulator to get band energy
+        const mBand = this._bpSample(this.modFilters[b], m);
 
-        // t at current position
-        const t0 = this.stepPos * invHop;
-        const t1 = Math.min((this.stepPos + 1) * invHop, 1);
+        // Full-wave rectify → envelope follow
+        const rect = Math.abs(mBand);
+        const env  = this.envState[b];
+        this.envState[b] = env + (rect > env ? atk : rel) * (rect - env);
 
-        for (let j = 0; j < order; j++) {
-          const c0 = this.frameCoeffs[base     + j];
-          const c1 = this.frameCoeffs[nextBase + j];
-          this.curCoeffs[j] = c0 + (c1 - c0) * t0;
-          this.dCoeffs[j]   = (c1 - c0) * invHop;
-        }
-        const g0 = this.frameGains[frameIdx],  g1 = this.frameGains[nextIdx];
-        const v0 = this.frameVoiced[frameIdx], v1 = this.frameVoiced[nextIdx];
-        const p0 = this.framePitch[frameIdx],  p1 = this.framePitch[nextIdx];
-
-        this.curGain   = g0 + (g1 - g0) * t0;
-        this.curVoiced = v0 + (v1 - v0) * t0;
-        this.curPitch  = p0 + (p1 - p0) * t0;
-        this.dGain     = (g1 - g0) * invHop;
-        this.dVoiced   = (v1 - v0) * invHop;
-        this.dPitch    = (p1 - p0) * invHop;
+        // Bandpass the carrier, apply envelope as gain
+        const cBand = this._bpSample(this.carFilters[b], c);
+        out += cBand * this.envState[b];
       }
 
-      // Step interpolated state forward by one sample (just additions)
-      for (let j = 0; j < order; j++) this.curCoeffs[j] += this.dCoeffs[j];
-      this.curGain   += this.dGain;
-      this.curVoiced += this.dVoiced;
-      this.curPitch  += this.dPitch;
-      this.samplePos++;
-
-      // Excitation
-      const exc = this._carrier(
-        Math.max(0, Math.min(1, this.curVoiced)),
-        Math.max(0, this.curPitch)
-      ) * Math.max(0, this.curGain);
-
-      // All-pole LPC synthesis
-      let y = exc;
-      const d = this.synthDelay;
-      const c = this.curCoeffs;
-      for (let j = 0; j < order; j++) y += c[j] * d[j];
-      for (let j = order - 1; j > 0; j--) d[j] = d[j-1];
-      d[0] = y;
-
-      // De-emphasis (undo pre-emphasis boost)
-      y += this.deEmphAlpha * this.deEmphPrev;
-      this.deEmphPrev = y;
-
-      // Soft clip
-      output[i] = Math.tanh(y * this.vol);
+      // Scale: compensate for band overlap summation
+      output[i] = Math.tanh(out * this.vol * (2.5 / n));
     }
 
+    // Send RMS for VU display
     this.displayCounter += bs;
     if (this.displayCounter >= 512) {
       this.displayCounter = 0;
       let rms = 0;
       for (let i = 0; i < bs; i++) rms += output[i] * output[i];
-      this.port.postMessage({ rms: Math.sqrt(rms / bs), voiced: this.curVoiced });
+      this.port.postMessage({ rms: Math.sqrt(rms / bs) });
     }
 
     return true;
   }
 }
-registerProcessor('lpc-vocoder', LPCVocoderWorklet);
+registerProcessor('channel-vocoder', ChannelVocoderWorklet);
 `;
 
     const blob = new Blob([workletCode], { type: 'application/javascript' });
@@ -1691,67 +1415,55 @@ registerProcessor('lpc-vocoder', LPCVocoderWorklet);
     await this.ctx.audioWorklet.addModule(workletUrl);
     URL.revokeObjectURL(workletUrl);
 
-    // Source node
+    // Source — the uploaded audio (modulator)
     this.nodes.src = this.ctx.createBufferSource();
     this.nodes.src.buffer = this.audioBuffer;
 
-    // Analyser for FFT display
+    // Analysers for display and pitch tracking
     this.nodes.analyser = this.ctx.createAnalyser();
     this.nodes.analyser.fftSize = 4096;
     this.nodes.analyser.smoothingTimeConstant = 0.1;
     this.rawFFT = new Float32Array(this.nodes.analyser.frequencyBinCount);
     this.nodes.src.connect(this.nodes.analyser);
 
-    // Pitch analyser for MIDI tracking
     this.nodes.pitchAnalyser = this.ctx.createAnalyser();
     this.nodes.pitchAnalyser.fftSize = 2048;
     this.nodes.pitchAnalyser.smoothingTimeConstant = 0;
     this._pitchBuf = new Float32Array(2048);
     this.nodes.src.connect(this.nodes.pitchAnalyser);
 
-    // LPC vocoder worklet — receives pre-analyzed frame tables, generates output.
-    // We connect a silent ConstantSourceNode as a dummy input because the Web Audio
-    // spec allows browsers to stop calling process() on nodes with no active inputs.
-    this.nodes.lpcWorklet = new AudioWorkletNode(this.ctx, 'lpc-vocoder', {
+    // Channel vocoder worklet — modulator audio feeds input 0
+    this.nodes.vocoderWorklet = new AudioWorkletNode(this.ctx, 'channel-vocoder', {
       numberOfInputs:  1,
       numberOfOutputs: 1,
       outputChannelCount: [1],
+      channelCount: 1,
       processorOptions: {
-        ...lpcParams,
-        numFrames:    numFrames,
-        totalSamples: totalSamples,
+        pitch:        mToF(pitch),
+        waveType,
+        unison,
+        detune,
+        noiseOn,
+        noiseLevel,
+        vibratoOn,
+        vibratoRate,
+        vibratoDepth,
+        vol:          dbToGain(vol),
       },
     });
 
-    // Transfer the large arrays via port instead of processorOptions to avoid
-    // structured-clone overhead and ensure typed arrays arrive correctly
-    this.nodes.lpcWorklet.port.postMessage(
-      { init: true, flatCoeffs, frameGains, frameVoiced, framePitch: smoothedPitch },
-      [flatCoeffs.buffer, frameGains.buffer, frameVoiced.buffer, smoothedPitch.buffer]
-    );
+    this.nodes.src.connect(this.nodes.vocoderWorklet);
 
-    // Silent dummy input to keep process() alive
-    this.nodes.silentSrc = this.ctx.createConstantSource();
-    this.nodes.silentSrc.offset.value = 0;
-    this.nodes.silentSrc.connect(this.nodes.lpcWorklet);
-    this.nodes.silentSrc.start();
-
-    // Store peakRms for velocity normalization in MIDI recorder
-    this._peakRms = peakRms;
-
-    // Receive display data from worklet
     this.vuLevel = 0;
-    this.nodes.lpcWorklet.port.onmessage = (e) => {
+    this.nodes.vocoderWorklet.port.onmessage = (e) => {
       if (e.data?.rms !== undefined) this.vuLevel = e.data.rms;
     };
 
-    // Scope analyser on output
     this.nodes.scopeAnalyser = this.ctx.createAnalyser();
     this.nodes.scopeAnalyser.fftSize = 2048;
     this.nodes.scopeAnalyser.smoothingTimeConstant = 0.8;
     this.scopeData = new Float32Array(this.nodes.scopeAnalyser.frequencyBinCount);
 
-    // Master chain
     this.nodes.masterGain = this.ctx.createGain();
     this.nodes.masterGain.gain.value = 1.0;
 
@@ -1771,14 +1483,14 @@ registerProcessor('lpc-vocoder', LPCVocoderWorklet);
     this.nodes.vuAnalyser = this.ctx.createAnalyser();
     this.nodes.vuAnalyser.fftSize = 256;
 
-    this.nodes.lpcWorklet.connect(this.nodes.masterGain);
+    this.nodes.vocoderWorklet.connect(this.nodes.masterGain);
     this.nodes.masterGain.connect(this.nodes.comp);
 
     if (reverbOn) {
-      this.nodes.reverb = await buildReverb(this.ctx, 2.0);
+      this.nodes.reverb     = await buildReverb(this.ctx, 2.0);
       this.nodes.reverbGain = this.ctx.createGain();
       this.nodes.reverbGain.gain.value = reverbMix;
-      this.nodes.dryGain = this.ctx.createGain();
+      this.nodes.dryGain    = this.ctx.createGain();
       this.nodes.dryGain.gain.value = 1 - reverbMix * 0.5;
       this.nodes.comp.connect(this.nodes.dryGain).connect(this.nodes.limiter);
       this.nodes.comp.connect(this.nodes.reverb).connect(this.nodes.reverbGain).connect(this.nodes.limiter);
@@ -1790,6 +1502,7 @@ registerProcessor('lpc-vocoder', LPCVocoderWorklet);
     this.nodes.limiter.connect(this.nodes.scopeAnalyser);
     this.nodes.limiter.connect(this.ctx.destination);
   }
+
 
   start(onEnded) {
     if (!this.audioBuffer) return false;
@@ -1807,9 +1520,8 @@ registerProcessor('lpc-vocoder', LPCVocoderWorklet);
       if (lfo) try { lfo.stop(); } catch(e){}
     });
     try { if (this.nodes.src) this.nodes.src.stop(); } catch(e){}
-    try { if (this.nodes.noiseSrc)   this.nodes.noiseSrc.stop();   } catch(e){}
-    try { if (this.nodes.silentSrc)  this.nodes.silentSrc.stop();  } catch(e){}
-    try { if (this.nodes.lpcWorklet) this.nodes.lpcWorklet.disconnect(); } catch(e){}
+    try { if (this.nodes.noiseSrc)      this.nodes.noiseSrc.stop();        } catch(e){}
+    try { if (this.nodes.vocoderWorklet) this.nodes.vocoderWorklet.disconnect(); } catch(e){}
     Object.values(this.nodes).forEach(n => { if (n && n.disconnect) try { n.disconnect(); } catch(e){} });
     this.nodes = {};
     this.carrierOscillators = [];
@@ -1821,17 +1533,16 @@ registerProcessor('lpc-vocoder', LPCVocoderWorklet);
   setPitch(midi) {
     if (!this.isPlaying) return;
     const freq = mToF(midi);
-    if (this.nodes.lpcWorklet) {
-      this.nodes.lpcWorklet.port.postMessage({ pitch: freq });
-    }
+    if (this.nodes.vocoderWorklet)
+      this.nodes.vocoderWorklet.port.postMessage({ pitch: freq });
   }
 
   setVolume(db) {
     if (this.nodes.masterGain) {
       this.nodes.masterGain.gain.setTargetAtTime(dbToGain(db), this.ctx.currentTime, 0.1);
     }
-    if (this.nodes.lpcWorklet) {
-      this.nodes.lpcWorklet.port.postMessage({ vol: dbToGain(db) });
+    if (this.nodes.vocoderWorklet) {
+      this.nodes.vocoderWorklet.port.postMessage({ vol: dbToGain(db) });
     }
   }
 
@@ -2464,14 +2175,14 @@ class UIController {
       { id: 'vol', label: 'MASTER OUT', min: -24, max: 12, value: 0, step: 1, unit: ' dB',
         format: v => (v > 0 ? '+' : '') + v, onChange: v => { this.engine.params.vol = v; this.engine.setVolume(v); this._clearAuto('vol'); } },
       { id: 'detune', label: 'DETUNE', min: 0, max: 50, value: 15, step: 1, unit: ' ¢',
-        format: v => v, onChange: v => { this.engine.params.detune = v; if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ detune: v }); } },
+        format: v => v, onChange: v => { this.engine.params.detune = v; if (this.engine.nodes.vocoderWorklet) this.engine.nodes.vocoderWorklet.port.postMessage({ detune: v }); } },
       { id: 'formantShift', label: 'FORMANT', min: -12, max: 12, value: 0, step: 1, unit: ' st',
         format: v => (v > 0 ? '+' : '') + v, onChange: v => this.engine.params.formantShift = v },
       { id: 'reverbMix', label: 'REVERB', min: 0, max: 1, value: 0.25, step: 0.05, unit: '',
         format: v => Math.round(v * 100) + '%', onChange: v => { this.engine.params.reverbMix = v;
           if (this.engine.nodes.reverbGain) this.engine.nodes.reverbGain.gain.setTargetAtTime(v, this.engine.ctx.currentTime, 0.05); } },
       { id: 'vibratoDepth', label: 'VIBRATO', min: 0, max: 50, value: 8, step: 1, unit: ' ¢',
-        format: v => v, onChange: v => { this.engine.params.vibratoDepth = v; if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ vibratoDepth: v }); } },
+        format: v => v, onChange: v => { this.engine.params.vibratoDepth = v; if (this.engine.nodes.vocoderWorklet) this.engine.nodes.vocoderWorklet.port.postMessage({ vibratoDepth: v }); } },
     ];
 
     defs.forEach(def => {
@@ -2569,7 +2280,7 @@ class UIController {
         btn.classList.add('active');
         this.engine.params.waveType = btn.dataset.wave;
         document.getElementById('oscLabel').textContent = btn.textContent;
-        if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ waveType: btn.dataset.wave });
+        if (this.engine.nodes.vocoderWorklet) this.engine.nodes.vocoderWorklet.port.postMessage({ waveType: btn.dataset.wave });
       });
     });
 
@@ -2580,13 +2291,13 @@ class UIController {
         btn.classList.add('active');
         this.engine.params.unison = parseInt(btn.dataset.v);
         document.getElementById('unisonLabel').textContent = btn.dataset.v;
-        if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ unison: parseInt(btn.dataset.v) });
+        if (this.engine.nodes.vocoderWorklet) this.engine.nodes.vocoderWorklet.port.postMessage({ unison: parseInt(btn.dataset.v) });
       });
     });
 
     // Toggles
-    this._bindToggle('vibratoToggle', v => { this.engine.params.vibratoOn = v; if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ vibratoOn: v }); });
-    this._bindToggle('noiseToggle',   v => { this.engine.params.noiseOn = v;   if (this.engine.nodes.lpcWorklet) this.engine.nodes.lpcWorklet.port.postMessage({ noiseOn: v }); }, true);
+    this._bindToggle('vibratoToggle', v => { this.engine.params.vibratoOn = v; if (this.engine.nodes.vocoderWorklet) this.engine.nodes.vocoderWorklet.port.postMessage({ vibratoOn: v }); });
+    this._bindToggle('noiseToggle',   v => { this.engine.params.noiseOn = v;   if (this.engine.nodes.vocoderWorklet) this.engine.nodes.vocoderWorklet.port.postMessage({ noiseOn: v }); }, true);
     this._bindToggle('reverbToggle',  v => this.engine.params.reverbOn = v, true);
     this._bindToggle('formantLockToggle', v => this.engine.params.formantLock = v);
 
@@ -2641,7 +2352,7 @@ class UIController {
 
     // Feed pitch to MIDI recorder — use source RMS for velocity, not vocoder output
     const midiVel = this.engine._pitchRms != null ? this.engine._pitchRms : this.engine.vuLevel;
-    const peakRms = this.engine._peakRms || 0.1;
+    const peakRms = this.engine._peakRms || this.engine.vuLevel * 2 || 0.1;
     this.midi.feed(this.engine.detectedMidi, midiVel, peakRms);
     const nc = this.midi.noteCount;
     document.getElementById('midiNoteCount').textContent = nc;
