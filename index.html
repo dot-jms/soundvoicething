@@ -1237,9 +1237,9 @@ class AudioEngine {
     // We have the full buffer — analyze everything upfront at maximum quality.
     // Shorter frames (15ms) for temporal resolution, higher order (20) for spectral detail,
     // tighter hop (4ms) for smooth transitions, plus per-frame pitch tracking.
-    const LPC_ORDER_NEW  = 20;    // more poles = better formant detail
-    const LPC_FRAME_MS   = 15;    // shorter = catches fast consonants better
-    const LPC_HOP_MS     = 4;     // 4ms hop = 250 frames/sec — very fine-grained
+    const LPC_ORDER_NEW  = 20;
+    const LPC_FRAME_MS   = 30;    // 30ms — fits one full period of 33Hz voice, prevents instability
+    const LPC_HOP_MS     = 5;     // 5ms hop — still 200 frames/sec, fine-grained enough
     const PREEMPH_ALPHA  = 0.97;
     const MIN_PITCH_HZ   = 60;
     const MAX_PITCH_HZ   = 500;
@@ -1302,10 +1302,11 @@ class AudioEngine {
         return { coeffs: new Float32Array(p), gain: 0, voiced, rms };
       }
 
-      // Bandwidth expansion gamma = 0.992
+      // Bandwidth expansion gamma = 0.98 — tighter for longer frames, keeps all poles
+      // well inside the unit circle even for low-pitched voices
       let g = 1.0;
-      for (let k = 1; k <= p; k++) { g *= 0.992; r[k] *= g; }
-      r[0] *= 1.0002;
+      for (let k = 1; k <= p; k++) { g *= 0.98; r[k] *= g; }
+      r[0] *= 1.001;
 
       const a   = new Float32Array(p + 1);
       const tmp = new Float32Array(p + 1);
@@ -1409,14 +1410,19 @@ class AudioEngine {
     const frameGains  = new Float32Array(numFrames);
     const frameVoiced = new Float32Array(numFrames);
     const framePitch  = new Float32Array(numFrames);
+    const frameRms    = new Float32Array(numFrames); // for velocity normalization
 
     for (let f = 0; f < numFrames; f++) {
       const res = analyzeFrame(f * hopSize);
       frameCoeffs[f]  = res.coeffs;
       frameGains[f]   = res.gain;
       frameVoiced[f]  = res.voiced;
-      framePitch[f]   = pitchPerFrame[f]; // from coarse pitch pass above
+      framePitch[f]   = pitchPerFrame[f];
+      frameRms[f]     = res.rms;
     }
+
+    // Peak RMS across whole recording — used to normalize velocity to full 1-127 range
+    const peakRms = Math.max(...frameRms) || 0.1;
 
     // ── Pitch smoothing pass ──
     // Median-filter the pitch track over ±3 frames to remove octave jumps,
@@ -1562,10 +1568,12 @@ class LPCVocoderWorklet extends AudioWorkletProcessor {
       pitchMod = Math.pow(2, Math.sin(6.283185307 * this.vibratoPhase) * this.vibratoDepth / 1200);
     }
 
-    // Pitch-tracking: follow detected pitch for voiced segments (gives natural inflection),
-    // fall back to userPitch for unvoiced/silence.
-    // The "pitch" knob now acts as a global transpose, not override.
-    const trackPitch = pitch > 0 ? pitch * (this.userPitch / 130.81) : this.userPitch;
+    // Pitch tracking: use the detected voice pitch directly as the carrier frequency.
+    // The user pitch knob transposes up/down from the original — it's a semitone offset,
+    // not an absolute pitch. This means the carrier follows your voice's actual inflection.
+    // userPitch is in Hz (from mToF(midi)), default C3 = 130.81Hz = 0 semitones offset.
+    const transposeRatio = pitch > 0 ? this.userPitch / 130.81 : 1.0;
+    const trackPitch = pitch > 0 ? pitch * transposeRatio : this.userPitch;
     const f = trackPitch * pitchMod;
 
     const n = this.unison;
@@ -1727,6 +1735,9 @@ registerProcessor('lpc-vocoder', LPCVocoderWorklet);
     this.nodes.silentSrc.offset.value = 0;
     this.nodes.silentSrc.connect(this.nodes.lpcWorklet);
     this.nodes.silentSrc.start();
+
+    // Store peakRms for velocity normalization in MIDI recorder
+    this._peakRms = peakRms;
 
     // Receive display data from worklet
     this.vuLevel = 0;
@@ -1897,18 +1908,24 @@ registerProcessor('lpc-vocoder', LPCVocoderWorklet);
           const sorted = [...valid].sort((a, b) => a - b);
           let median = sorted[Math.floor(sorted.length / 2)];
 
-          // Octave correction: if rawMidi is exactly 12 semitones from median,
-          // it's almost certainly an octave detection error — snap to median octave.
-          // This is the #1 source of pitch instability in autocorrelation detectors.
+          // Octave correction against median
           if (rawMidi >= 0) {
             const diff = rawMidi - median;
-            if (Math.abs(diff - 12) < 1.5) median = rawMidi - 12;
+            if      (Math.abs(diff - 12) < 1.5) median = rawMidi - 12;
             else if (Math.abs(diff + 12) < 1.5) median = rawMidi + 12;
             else if (Math.abs(diff - 24) < 1.5) median = rawMidi - 24;
             else if (Math.abs(diff + 24) < 1.5) median = rawMidi + 24;
           }
 
-          this.detectedMidi = median;
+          // Second octave correction against last stable note — catches jumps
+          // the median missed because the history window flipped
+          if (this.lastMidi >= 0 && median >= 0) {
+            const diff2 = median - this.lastMidi;
+            if      (Math.abs(diff2 - 12) < 2) median = median - 12;
+            else if (Math.abs(diff2 + 12) < 2) median = median + 12;
+          }
+
+          this.detectedMidi = Math.max(24, Math.min(84, median)); // clamp to 2 octaves either side of middle
         } else {
           this.detectedMidi = rawMidi;
         }
@@ -2148,16 +2165,14 @@ class MidiRecorder {
   }
 
   // Called every frame with current detected pitch (midi float, or -1 for silence)
-  feed(midiFloat, volume) {
+  feed(midiFloat, volume, peakRms = 0.1) {
     if (!this.isRecording) return;
     const now  = (performance.now() - this.startTime) / 1000;
     const midi = midiFloat >= 0 ? Math.round(midiFloat) : -1;
 
-    // Velocity: map RMS (typically 0.01–0.3) to full 1–127 range
-    // Use dB scaling: 20*log10(rms), map -40dB..0dB → 1..127
-    const rms   = Math.max(volume, 1e-6);
-    const db    = 20 * Math.log10(rms);  // typically -40 to 0
-    const vel   = Math.min(127, Math.max(1, Math.round((db + 40) / 40 * 126 + 1)));
+    // Velocity normalized against peak RMS of the recording → full 1-127 range
+    const normalized = Math.min(1, volume / peakRms);
+    const vel = Math.min(127, Math.max(1, Math.round(normalized * 126 + 1)));
 
     // Stability buffer — require pitch to hold for MIN_STABLE frames before switching
     const MIN_STABLE    = 3;   // ~50ms at 60fps — ignores single-frame blips
@@ -2626,7 +2641,8 @@ class UIController {
 
     // Feed pitch to MIDI recorder — use source RMS for velocity, not vocoder output
     const midiVel = this.engine._pitchRms != null ? this.engine._pitchRms : this.engine.vuLevel;
-    this.midi.feed(this.engine.detectedMidi, midiVel);
+    const peakRms = this.engine._peakRms || 0.1;
+    this.midi.feed(this.engine.detectedMidi, midiVel, peakRms);
     const nc = this.midi.noteCount;
     document.getElementById('midiNoteCount').textContent = nc;
 
