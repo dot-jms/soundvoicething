@@ -1238,7 +1238,8 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
     this.sr  = sr;
     this.n   = ${NUM_BANDS};
 
-    this.pitch        = p.pitch;
+    // User-controlled carrier params
+    this.userPitch    = p.pitch;   // base pitch in Hz (acts as transpose)
     this.waveType     = p.waveType;
     this.unison       = Math.max(1, p.unison);
     this.detune       = p.detune;
@@ -1255,14 +1256,31 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
 
     const freqs = ${JSON.stringify(Array.from(bandFreqs))};
 
-    // Q=5: bands are distinct enough to resolve musical notes but wide enough
-    // to overlap smoothly. Q=2.5 was so wide everything blurred together.
-    this.modFilters = freqs.map(f => this._makeBP(f, 5.0, sr));
-    this.carFilters = freqs.map(f => this._makeBP(f, 5.0, sr));
+    // Modulator analysis filters — bandpass to measure per-band energy
+    this.modFilters = freqs.map(f => this._makeBP(f, 6.0, sr));
 
-    this.atkCoeff  = 1 - Math.exp(-1 / (sr * ${ATK_MS / 1000}));
-    this.relCoeff  = 1 - Math.exp(-1 / (sr * ${REL_MS / 1000}));
-    this.envState  = new Float32Array(this.n);
+    // Carrier shaping: peaking EQ filters driven by band envelopes.
+    // The carrier passes through all EQ filters in series — its harmonics
+    // are boosted at frequencies where the modulator has energy.
+    this.eqFilters = freqs.map(f => this._makePeak(f, 4.0, sr));
+
+    this.atkCoeff = 1 - Math.exp(-1 / (sr * ${ATK_MS / 1000}));
+    this.relCoeff = 1 - Math.exp(-1 / (sr * ${REL_MS / 1000}));
+    this.envState = new Float32Array(this.n);
+
+    // Built-in pitch tracker — runs every 10ms in audio thread
+    // Detects the dominant pitch of the modulator and drives the carrier.
+    // This is what makes the carrier follow the melody note-for-note.
+    const pitchBufSize  = 2048;
+    this.pitchBuf       = new Float32Array(pitchBufSize);
+    this.pitchBufSize   = pitchBufSize;
+    this.pitchWrite     = 0;
+    this.pitchFill      = 0;
+    this.pitchHop       = Math.round(sr * 0.010); // re-detect every 10ms
+    this.pitchTimer     = 0;
+    this.detectedHz     = p.pitch;
+    this.pitchSmooth    = p.pitch;
+    this.pitchSmoothK   = 0.15; // portamento smoothing — higher = snappier
 
     this.ns = (Math.random() * 0xffffffff) >>> 0;
     this.displayCounter = 0;
@@ -1270,7 +1288,7 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
     this.port.onmessage = (e) => {
       if (!e.data) return;
       const d = e.data;
-      if (d.pitch        !== undefined) this.pitch        = d.pitch;
+      if (d.pitch        !== undefined) this.userPitch    = d.pitch;
       if (d.waveType     !== undefined) this.waveType     = d.waveType;
       if (d.detune       !== undefined) this.detune       = d.detune;
       if (d.noiseOn      !== undefined) this.noiseOn      = d.noiseOn;
@@ -1310,6 +1328,75 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
     return y;
   }
 
+  _makePeak(freq, Q, sr) {
+    const w0    = 2 * Math.PI * freq / sr;
+    const cosw  = Math.cos(w0);
+    const sinw  = Math.sin(w0);
+    const alpha = sinw / (2 * Q);
+    return { w0, cosw, sinw, alpha, Q, x1:0, x2:0, y1:0, y2:0 };
+  }
+
+  _peakSample(f, x, gainNorm) {
+    // gainNorm 0..1 → 0..+18dB boost
+    const A   = Math.pow(10, gainNorm * 18 / 40);
+    const alp = f.alpha;
+    const a0  = 1 + alp / A;
+    const b0  = (1 + alp * A) / a0;
+    const b1  = (-2 * f.cosw) / a0;
+    const b2  = (1 - alp * A) / a0;
+    const a1  = b1;
+    const a2  = (1 - alp / A) / a0;
+    const y   = b0*x + b1*f.x1 + b2*f.x2 - a1*f.y1 - a2*f.y2;
+    f.x2 = f.x1; f.x1 = x;
+    f.y2 = f.y1; f.y1 = y;
+    return y;
+  }
+
+  _detectPitch() {
+    const buf    = this.pitchBuf;
+    const n      = this.pitchBufSize;
+    const sr     = this.sr;
+    const minLag = Math.round(sr / 900);
+    const maxLag = Math.round(sr / 55);
+
+    // Quick RMS on buffer
+    let rms = 0;
+    for (let i = 0; i < n; i++) rms += buf[i] * buf[i];
+    if (Math.sqrt(rms / n) < 0.003) return;
+
+    // YIN normalized difference function — finds fundamental period
+    let cumSum = 0;
+    for (let tau = minLag; tau <= maxLag; tau++) {
+      let d = 0;
+      const lim = n - tau;
+      for (let i = 0; i < lim; i++) {
+        const diff = buf[i] - buf[i + tau];
+        d += diff * diff;
+      }
+      cumSum += d;
+      const dn = cumSum > 0 ? d * tau / cumSum : 1;
+      if (dn < 0.15) {
+        // Parabolic interpolation for sub-sample accuracy
+        const dnPrev = tau > minLag ? (() => {
+          let dp = 0, cs = 0;
+          for (let t2 = minLag; t2 < tau; t2++) {
+            let dd = 0;
+            for (let i = 0; i < n-t2; i++) { const df=buf[i]-buf[i+t2]; dd+=df*df; }
+            cs += dd;
+          }
+          // approximate: just use dn as-is for prev
+          return dn;
+        })() : dn;
+        // Simplified: just take the detected tau directly
+        const hz = sr / tau;
+        if (hz > 50 && hz < 1000) {
+          this.detectedHz = hz * (this.userPitch / 130.81);
+        }
+        return;
+      }
+    }
+  }
+
   _noise() {
     let x = this.ns;
     x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
@@ -1324,16 +1411,13 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
     return 0;
   }
 
-  // Carrier: pitched oscillator PLUS broadband buzz so every band has energy.
-  // A pure sine at 200Hz has no energy in the 2kHz band — the carrier needs
-  // harmonics reaching up to the highest band for the vocoder to work.
-  _carrier() {
+  _carrier(pitchHz) {
     let pitchMod = 1.0;
     if (this.vibratoOn) {
       this.vibratoPhase = (this.vibratoPhase + this.vibratoRate / this.sr) % 1;
       pitchMod = Math.pow(2, Math.sin(6.283185307 * this.vibratoPhase) * this.vibratoDepth / 1200);
     }
-    const f = this.pitch * pitchMod;
+    const f = pitchHz * pitchMod;
     const n = this.unison;
     let out = 0;
     for (let v = 0; v < n; v++) {
@@ -1349,8 +1433,7 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
       out += s;
     }
     out /= n;
-    // Always mix in a small amount of broadband noise so high-frequency bands
-    // have carrier energy to shape. Without this, bands above ~2kHz are dead.
+    // 15% broadband noise so high EQ bands have carrier energy to boost
     out = out * 0.85 + this._noise() * 0.15;
     if (this.noiseOn && this.noiseLevel > 0)
       out += this._noise() * this.noiseLevel * 0.2;
@@ -1370,21 +1453,43 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
 
     for (let i = 0; i < bs; i++) {
       const m = mod[i];
-      const c = this._carrier();
 
-      let out = 0;
+      // Buffer modulator for pitch detection
+      this.pitchBuf[this.pitchWrite] = m;
+      this.pitchWrite = (this.pitchWrite + 1) % this.pitchBufSize;
+      this.pitchFill  = Math.min(this.pitchFill + 1, this.pitchBufSize);
+
+      // Run pitch detection every pitchHop samples
+      if (++this.pitchTimer >= this.pitchHop) {
+        this.pitchTimer = 0;
+        this._detectPitch();
+        // Smooth pitch with exponential moving average — prevents zipper noise
+        // but fast enough to track note changes
+        this.pitchSmooth += (this.detectedHz - this.pitchSmooth) * this.pitchSmoothK;
+      }
+
+      // Step 1: measure per-band envelope
+      let peakEnv = 1e-9;
       for (let b = 0; b < n; b++) {
-        // Bandpass modulator → rectify → envelope follow
         const mBand = this._bpSample(this.modFilters[b], m);
         const rect  = Math.abs(mBand);
         const env   = this.envState[b];
         this.envState[b] = env + (rect > env ? atk : rel) * (rect - env);
-
-        // Bandpass carrier → scale by envelope
-        out += this._bpSample(this.carFilters[b], c) * this.envState[b];
+        if (this.envState[b] > peakEnv) peakEnv = this.envState[b];
       }
 
-      output[i] = Math.tanh(out * this.vol * (4.0 / Math.sqrt(n)));
+      // Step 2: generate carrier at detected pitch
+      let c = this._carrier(this.pitchSmooth);
+
+      // Step 3: apply band envelopes as dynamic EQ on carrier
+      // Normalize so loudest band drives maximum boost
+      for (let b = 0; b < n; b++) {
+        const g = this.envState[b] / peakEnv;
+        c = this._peakSample(this.eqFilters[b], c, g);
+      }
+
+      // Amplitude: track overall modulator loudness
+      output[i] = Math.tanh(c * peakEnv * n * 0.08 * this.vol);
     }
 
     this.displayCounter += bs;
@@ -1392,7 +1497,7 @@ class ChannelVocoderWorklet extends AudioWorkletProcessor {
       this.displayCounter = 0;
       let rms = 0;
       for (let i = 0; i < bs; i++) rms += output[i] * output[i];
-      this.port.postMessage({ rms: Math.sqrt(rms / bs) });
+      this.port.postMessage({ rms: Math.sqrt(rms / bs), pitch: this.pitchSmooth });
     }
     return true;
   }
@@ -1631,6 +1736,12 @@ registerProcessor('channel-vocoder', ChannelVocoderWorklet);
           this.detectedMidi = rawMidi;
         }
         this._pitchRms = rmsP;
+
+        // Feed detected pitch to carrier in real time — this is the key thing
+        // that makes the vocoder follow the melody instead of droning on one note
+        if (this.detectedMidi >= 0 && this.nodes.vocoderWorklet) {
+          this.nodes.vocoderWorklet.port.postMessage({ pitch: mToF(this.detectedMidi) });
+        }
       } else {
         this.detectedMidi = -1;
         this._pitchRms = 0;
